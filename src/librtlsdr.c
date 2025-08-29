@@ -118,6 +118,7 @@ struct rtlsdr_dev {
 	/* status */
 	int dev_lost;
 	int driver_active;
+	int xfer_cancelled;
 	unsigned int xfer_errors;
 	char manufact[256];
 	char product[256];
@@ -1723,7 +1724,9 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 
 		libusb_submit_transfer(xfer); /* resubmit transfer */
 		dev->xfer_errors = 0;
-	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
+	} else if (LIBUSB_TRANSFER_CANCELLED == xfer->status) {
+		dev->xfer_cancelled = 1;
+	} else {
 #ifndef _WIN32
 		if (LIBUSB_TRANSFER_ERROR == xfer->status)
 			dev->xfer_errors++;
@@ -1881,6 +1884,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 
 	dev->async_status = RTLSDR_RUNNING;
 	dev->async_cancel = 0;
+	dev->xfer_cancelled = 0;
 
 	dev->cb = cb;
 	dev->cb_ctx = ctx;
@@ -1943,14 +1947,13 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 				if (LIBUSB_TRANSFER_CANCELLED !=
 						dev->xfer[i]->status) {
 					r = libusb_cancel_transfer(dev->xfer[i]);
-					/* handle events after canceling
-					 * to allow transfer status to
-					 * propagate */
-#ifdef _WIN32
-					Sleep(1);
-#endif
+
+					/* wait for cancel callback ack */
+					while (! dev->xfer_cancelled) {};
+					dev->xfer_cancelled = 0;
+
 					libusb_handle_events_timeout_completed(dev->ctx,
-									       &zerotv, NULL);
+									       &tv, NULL);
 					if (r < 0)
 						continue;
 
