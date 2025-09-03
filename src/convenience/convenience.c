@@ -24,6 +24,11 @@
 #include <stdlib.h>
 
 #ifndef _WIN32
+#if defined __linux__
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#endif
 #include <unistd.h>
 #else
 #include <windows.h>
@@ -245,6 +250,88 @@ int verbose_reset_buffer(rtlsdr_dev_t *dev)
 	return r;
 }
 
+#if defined __linux__
+static int read_uint8_from_file(const char *path, uint8_t *value)
+{
+	FILE *f;
+	int r, v;
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	r = fscanf(f, "%d", &v);
+	fclose(f);
+	if (r != 1) {
+		return -1;
+	}
+	if (v < 0 || v > 255) {
+		return -1;
+	}
+	*value = (uint8_t) v;
+	return 0;
+}
+
+
+static int get_usb_bus_address_by_path(const char *device_path,
+				       uint8_t *bus_number,
+				       uint8_t *device_address)
+{
+	struct stat st;
+	int r;
+	int maj, min;
+	ssize_t ssz;
+	char p1[PATH_MAX], p2[PATH_MAX];
+	char *ptr = NULL;
+	uint8_t busnum, devnum;
+
+	/* device_path should be a character-special device */
+	r = stat(device_path, &st);
+	if (r || !S_ISCHR(st.st_mode))
+		return -1;
+	maj = major(st.st_rdev);
+	min = minor(st.st_rdev);
+
+	/* Check that it's a USB device /sys/bus/usb */
+	r = snprintf(p1, sizeof(p1), "/sys/dev/char/%d:%d/subsystem", maj, min);
+	if (r < 0 || r >= (int)sizeof(p1))
+		return -1;
+	ptr = realpath(p1, p2);
+	if (!ptr)
+		return -1;
+	if (strcmp("/sys/bus/usb", p2))
+		return -1;
+
+	/* Read the bus number */
+	r = snprintf(p1, sizeof(p1), "/sys/dev/char/%d:%d/busnum", maj, min);
+	if (r < 0 || r >= (int)sizeof(p1))
+		return -1;
+	r = read_uint8_from_file(p1, &busnum);
+	if (r < 0)
+		return -1;
+
+	/* Read the device number */
+	r = snprintf(p1, sizeof(p1), "/sys/dev/char/%d:%d/devnum", maj, min);
+	if (r < 0 || r >= (int)sizeof(p1))
+		return -1;
+	r = read_uint8_from_file(p1, &devnum);
+	if (r < 0)
+		return -1;
+
+	*bus_number = busnum;
+	*device_address = devnum;
+	return 0;
+}
+
+static int get_index_by_device_path(const char *device_path)
+{
+	int r, index;
+	uint8_t busnum, devnum;
+	r = get_usb_bus_address_by_path(device_path, &busnum, &devnum);
+	if (r < 0)
+		return -1;
+	return rtlsdr_get_index_by_device_address(busnum, devnum);
+}
+#endif /* defined __linux__ */
+
 int verbose_device_search(char *s)
 {
 	int i, r, device_count, device, offset;
@@ -266,6 +353,18 @@ int verbose_device_search(char *s)
 		fprintf(stderr, "  %d:  %s, %s, SN: %s\n", i, vendor, product, serial);
 	}
 	fprintf(stderr, "\n");
+#if defined(__linux__)
+	/* does the string look like a device node */
+	if (s[0] == '/') {
+		fprintf(stderr, "Want device: %s\n", s);
+		device = get_index_by_device_path(s);
+		if (device >= 0) {
+			fprintf(stderr, "Using device %d: %s\n",
+				device, rtlsdr_get_device_name((uint32_t)device));
+			return device;
+		}
+	}
+#endif
 	/* does string look like raw id number */
 	device = (int)strtol(s, &s2, 0);
 	if (s2[0] == '\0' && device >= 0 && device < device_count) {

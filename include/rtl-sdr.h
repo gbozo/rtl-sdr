@@ -50,6 +50,18 @@ RTLSDR_API int rtlsdr_get_device_usb_strings(uint32_t index,
 					     char *serial);
 
 /*!
+ * Get device index by USB bus number and device address
+ *
+ * \param busnum USB bus number
+ * \param devnum USB device address
+ * \return device index of first device where the name matched
+ * \return -2 if no devices were found at all
+ * \return -3 if devices were found, but none with matching specified location
+ */
+RTLSDR_API int rtlsdr_get_index_by_device_address(uint8_t bus_number,
+					          uint8_t device_address);
+
+/*!
  * Get device index by USB serial string descriptor.
  *
  * \param serial serial string of the device

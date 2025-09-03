@@ -1410,6 +1410,49 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact,
 	return r;
 }
 
+int rtlsdr_get_index_by_device_address(uint8_t bus_number, uint8_t device_address)
+{
+	int i, r;
+	libusb_context *ctx;
+	libusb_device **list;
+	struct libusb_device_descriptor dd;
+	rtlsdr_dongle_t *device = NULL;
+	uint32_t device_count = 0;
+	ssize_t cnt;
+	uint8_t busnum, devnum;
+
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return r;
+
+	cnt = libusb_get_device_list(ctx, &list);
+	if (!cnt)
+		return -2;
+
+	r = -3;
+	for (i = 0; i < cnt; i++) {
+		libusb_get_device_descriptor(list[i], &dd);
+
+		device = find_known_device(dd.idVendor, dd.idProduct);
+		busnum = libusb_get_bus_number(list[i]);
+		devnum = libusb_get_device_address(list[i]);
+
+		if (device) {
+			if (busnum == bus_number && devnum == device_address) {
+				r = device_count;
+				break;
+			}
+			device_count++;
+		}
+	}
+
+	libusb_free_device_list(list, 1);
+
+	libusb_exit(ctx);
+
+	return r;
+}
+
 int rtlsdr_get_index_by_serial(const char *serial)
 {
 	int i, cnt, r;
