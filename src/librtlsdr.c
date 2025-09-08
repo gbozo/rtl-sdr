@@ -118,6 +118,7 @@ struct rtlsdr_dev {
 	/* status */
 	int dev_lost;
 	int driver_active;
+	int xfer_cancelled;
 	unsigned int xfer_errors;
 	char manufact[256];
 	char product[256];
@@ -1723,7 +1724,9 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
 
 		libusb_submit_transfer(xfer); /* resubmit transfer */
 		dev->xfer_errors = 0;
-	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
+	} else if (LIBUSB_TRANSFER_CANCELLED == xfer->status) {
+		dev->xfer_cancelled = 1;
+	} else {
 #ifndef _WIN32
 		if (LIBUSB_TRANSFER_ERROR == xfer->status)
 			dev->xfer_errors++;
@@ -1871,7 +1874,6 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	int r = 0;
 	struct timeval tv = { 1, 0 };
 	struct timeval zerotv = { 0, 0 };
-	enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
 
 	if (!dev)
 		return -1;
@@ -1881,6 +1883,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 
 	dev->async_status = RTLSDR_RUNNING;
 	dev->async_cancel = 0;
+	dev->xfer_cancelled = 0;
 
 	dev->cb = cb;
 	dev->cb_ctx = ctx;
@@ -1920,58 +1923,44 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		}
 	}
 
-	while (RTLSDR_INACTIVE != dev->async_status) {
+	if (RTLSDR_INACTIVE != dev->async_status) {
 		r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
 							   &dev->async_cancel);
 		if (r < 0) {
 			/*fprintf(stderr, "handle_events returned: %d\n", r);*/
 			if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
-				continue;
-			break;
+				r = 0;
+			return r;
 		}
 
-		if (RTLSDR_CANCELING == dev->async_status) {
-			next_status = RTLSDR_INACTIVE;
-
-			if (!dev->xfer)
-				break;
-
+		if (dev->xfer && RTLSDR_CANCELING == dev->async_status) {
 			for(i = 0; i < dev->xfer_buf_num; ++i) {
 				if (!dev->xfer[i])
 					continue;
 
-				if (LIBUSB_TRANSFER_CANCELLED !=
-						dev->xfer[i]->status) {
-					r = libusb_cancel_transfer(dev->xfer[i]);
-					/* handle events after canceling
-					 * to allow transfer status to
-					 * propagate */
-#ifdef _WIN32
-					Sleep(1);
-#endif
-					libusb_handle_events_timeout_completed(dev->ctx,
-									       &zerotv, NULL);
-					if (r < 0)
-						continue;
-
-					next_status = RTLSDR_CANCELING;
+				r = libusb_cancel_transfer(dev->xfer[i]);
+				if (r == LIBUSB_ERROR_NOT_FOUND) {
+					/* already completed */
+					r = 0;
+				} else if (r == 0) {
+					/* wait for cancel callback ack */
+					while (!dev->xfer_cancelled && !r) {
+						r = libusb_handle_events_timeout(dev->ctx, &tv);
+					}
 				}
-			}
-
-			if (dev->dev_lost || RTLSDR_INACTIVE == next_status) {
-				/* handle any events that still need to
-				 * be handled before exiting after we
-				 * just cancelled all transfers */
-				libusb_handle_events_timeout_completed(dev->ctx,
-								       &zerotv, NULL);
-				break;
+				dev->xfer_cancelled = 0;
 			}
 		}
+
+		/* handle any events that still need to
+		 * be handled before exiting after we
+		 * just cancelled all transfers */
+		libusb_handle_events_timeout(dev->ctx, &zerotv);
+
+		dev->async_status = RTLSDR_INACTIVE;
 	}
 
 	_rtlsdr_free_async_buffers(dev);
-
-	dev->async_status = next_status;
 
 	return r;
 }
