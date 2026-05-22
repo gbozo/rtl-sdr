@@ -32,3 +32,17 @@ jobs:
 
       - name: Verify library
         run: ls -la /usr/local/lib/librtlsdr* /usr/local/bin/rtl_*
+
+      - name: Package artifacts
+        run: |
+          ARTIFACT_DIR="rtl-sdr-${{ github.ref_name }}-${{ matrix.compiler }}-linux"
+          mkdir -p "$ARTIFACT_DIR/lib" "$ARTIFACT_DIR/include" "$ARTIFACT_DIR/bin"
+          cp /usr/local/lib/librtlsdr*.so* "$ARTIFACT_DIR/lib/"
+          cp /usr/local/lib/librtlsdr.a "$ARTIFACT_DIR/lib/"
+          cp /usr/local/include/rtl-sdr*.h "$ARTIFACT_DIR/include/"
+          cp /usr/local/bin/rtl_* "$ARTIFACT_DIR/bin/"
+          tar czf "$ARTIFACT_DIR.tar.gz" "$ARTIFACT_DIR"
+
+      - name: Upload release asset
+        run: |
+          gh release upload "${{ github.ref_name }}" "rtl-sdr-${{ github.ref_name }}-${{ matrix.compiler }}-linux.tar.gz" --clobber
