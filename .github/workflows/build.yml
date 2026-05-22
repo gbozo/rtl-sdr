@@ -8,6 +8,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         compiler: [gcc, clang]
 
@@ -30,4 +31,4 @@ jobs:
         run: sudo make install
 
       - name: Verify library
-        run: ldconfig -p | grep rtlsdr
+        run: ls -la /usr/local/lib/librtlsdr* /usr/local/bin/rtl_*
