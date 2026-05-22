@@ -8,7 +8,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define MAX_TAPS 512
+#define MAX_TAPS 4096
 
 struct rtlsdr_dsp {
 	uint64_t input_rate;
@@ -77,8 +77,6 @@ struct rtlsdr_dsp *rtlsdr_dsp_create(uint64_t input_rate,
 		return NULL;
 
 	R = (int)(input_rate / output_rate);
-	if (R < 2)
-		R = 1;
 	if (R < 1)
 		R = 1;
 
@@ -97,17 +95,26 @@ struct rtlsdr_dsp *rtlsdr_dsp_create(uint64_t input_rate,
 
 	dsp->num_phases = R;
 
-	if (bandwidth == 0 || bandwidth >= output_rate)
-		cutoff = 0.45;
-	else
-		cutoff = (double)bandwidth * 0.5 / (double)input_rate;
+	if (bandwidth >= output_rate || bandwidth == 0) {
+		cutoff = 0.45 * (double)output_rate / (double)input_rate;
+		dsp->num_taps = 128;
+	} else {
+		int tap_target;
+		double trans_norm;
+		tap_target = (int)(30.0 * (double)input_rate / (double)bandwidth + 0.5);
+		if (tap_target < 64)
+			tap_target = 64;
+		if (tap_target > MAX_TAPS)
+			tap_target = MAX_TAPS;
 
-	if (cutoff <= 0.0 || cutoff >= 0.5)
-		cutoff = 0.45;
+		trans_norm = 5.5 / (double)tap_target;
 
-	dsp->num_taps = 128;
-	if (dsp->num_taps > MAX_TAPS)
-		dsp->num_taps = MAX_TAPS;
+		cutoff = (double)bandwidth * 0.5 / (double)input_rate - trans_norm;
+		if (cutoff <= 0.0)
+			cutoff = (double)bandwidth * 0.25 / (double)input_rate;
+
+		dsp->num_taps = tap_target;
+	}
 
 	dsp->taps_per_phase = (dsp->num_taps + R - 1) / R;
 	if (dsp->taps_per_phase < 4)
