@@ -1,9 +1,41 @@
-rtl-sdr
-turns your Realtek RTL2832 based DVB dongle into a SDR receiver
+rtl-sdr — turns your Realtek RTL2832 based DVB dongle into a SDR receiver
 ======================================================================
 
-For more information see:
-http://sdr.osmocom.org/trac/wiki/rtl-sdr
+This is a fork of the Osmocom rtl-sdr project. The original repository
+is maintained by Osmocom at:
+
+  https://gitea.osmocom.org/sdr/rtl-sdr
+  https://github.com/osmocom/rtl-sdr (GitHub mirror)
+
+This fork was created after the v2.0.2 release (November 2025) and adds
+the following changes on top of upstream:
+
+  Multi-client rtl_tcp
+    rtl_tcp now supports multiple concurrent TCP clients instead of
+    a single connection. This allows sharing one dongle across several
+    SDR applications simultaneously.
+
+  Build fixes
+    Includes relative paths for use with FetchContent, CMake deprecation
+    warning fixes, and a fix for application hang on USB transfer errors.
+
+  CI / Release automation
+    GitHub Actions workflow builds the project with both gcc and clang
+    on every release. Compiled artifacts (shared/static libraries, headers,
+    executables) are packaged as tarballs and attached to each GitHub
+    release.
+
+  Docker images
+    Multi-stage Alpine-based Docker images are built and published to
+    ghcr.io on each release. The images contain the rtl-sdr runtime
+    libraries and all command-line utilities (rtl_sdr, rtl_tcp, rtl_test,
+    rtl_fm, rtl_eeprom, rtl_adsb, rtl_power, rtl_biast).
+
+    Usage:
+      docker run --rm ghcr.io/gbozo/rtl-sdr:<tag> rtl_test -h
+
+For more information on the upstream rtl-sdr project see:
+  http://sdr.osmocom.org/trac/wiki/rtl-sdr
 
 
 Notes on the mutability tree (2014/09/29)
@@ -132,4 +164,3 @@ correcting for will disappear.
 
 
 -- Oliver (oliver.jowett@gmail.com / oliver@mutability.co.uk)
-
