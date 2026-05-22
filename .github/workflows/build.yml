@@ -1,0 +1,33 @@
+name: Build
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+
+    env:
+      CC: ${{ matrix.compiler }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libusb-1.0-0-dev cmake build-essential
+
+      - name: Configure with CMake
+        run: cmake .
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Install
+        run: sudo make install
+
+      - name: Verify library
+        run: ldconfig -p | grep rtlsdr
