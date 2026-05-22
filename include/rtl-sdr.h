@@ -60,6 +60,36 @@ RTLSDR_API int rtlsdr_get_device_usb_strings(uint32_t index,
  */
 RTLSDR_API int rtlsdr_get_index_by_serial(const char *serial);
 
+/*!
+ * Callback for device enumeration.
+ *
+ * Called once per connected device. Return 0 to continue enumeration,
+ * non-0 to stop.
+ *
+ * \param index the device index (0-based)
+ * \param name device name string
+ * \param manufact manufacturer name string
+ * \param product product name string
+ * \param serial serial number string
+ * \param ctx user context pointer
+ * \return 0 to continue, non-0 to stop enumeration
+ */
+typedef int (*rtlsdr_device_cb)(int index, const char *name,
+    const char *manufact, const char *product, const char *serial, void *ctx);
+
+/*!
+ * Enumerate all connected RTL-SDR devices.
+ *
+ * Iterates over all connected devices, calling the callback for each
+ * known RTL-SDR dongle found. The callback receives device index, name,
+ * manufacturer, product, and serial strings.
+ *
+ * \param cb callback function called for each device
+ * \param ctx user context passed to callback
+ * \return number of devices found (may be 0)
+ */
+RTLSDR_API int rtlsdr_device_enumerate(rtlsdr_device_cb cb, void *ctx);
+
 RTLSDR_API int rtlsdr_open(rtlsdr_dev_t **dev, uint32_t index);
 
 RTLSDR_API int rtlsdr_close(rtlsdr_dev_t *dev);

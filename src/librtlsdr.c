@@ -1432,6 +1432,63 @@ int rtlsdr_get_index_by_serial(const char *serial)
 	return -3;
 }
 
+int rtlsdr_device_enumerate(rtlsdr_device_cb cb, void *ctx)
+{
+	int i, r;
+	libusb_context *libusb_ctx = NULL;
+	libusb_device **list;
+	struct libusb_device_descriptor dd;
+	rtlsdr_dev_t devt;
+	rtlsdr_dongle_t *known_dev = NULL;
+	int device_index = 0;
+	ssize_t cnt;
+
+	if (!cb)
+		return 0;
+
+	r = libusb_init(&libusb_ctx);
+	if (r < 0)
+		return 0;
+
+	cnt = libusb_get_device_list(libusb_ctx, &list);
+
+	for (i = 0; i < cnt; i++) {
+		libusb_get_device_descriptor(list[i], &dd);
+
+		known_dev = find_known_device(dd.idVendor, dd.idProduct);
+
+		if (known_dev) {
+			char vendor[256] = "";
+			char product_str[256] = "";
+			char serial[256] = "";
+
+			r = libusb_open(list[i], &devt.devh);
+			if (!r) {
+				rtlsdr_get_usb_strings(&devt, vendor,
+						       product_str, serial);
+				libusb_close(devt.devh);
+			}
+
+			r = cb(device_index,
+			       known_dev->name,
+			       vendor[0] ? vendor : NULL,
+			       product_str[0] ? product_str : NULL,
+			       serial[0] ? serial : NULL,
+			       ctx);
+
+			device_index++;
+
+			if (r)
+				break;
+		}
+	}
+
+	libusb_free_device_list(list, 1);
+	libusb_exit(libusb_ctx);
+
+	return device_index;
+}
+
 /* Returns true if the manufact_check and product_check strings match what is in the dongles EEPROM */
 int rtlsdr_check_dongle_model(void *dev, char *manufact_check, char *product_check)
 {
