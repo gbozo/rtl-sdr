@@ -5,8 +5,13 @@
 #include <pthread.h>
 
 #include "rtl_ring.h"
+#include "fft/fft_backend.h"
 
 #define RTLSTREAM_MAX_CLIENTS 32
+
+#define FFT_DEFAULT_BINS  1024
+#define FFT_DEFAULT_STEP  4096
+#define FFT_DEFAULT_ACCUM 4
 
 struct rtlsdr_client {
 	int       fd;
@@ -35,12 +40,32 @@ struct rtlsdr_server {
 	uint64_t  capture_freq;
 	uint64_t  capture_rate;
 
+	int       freq_changed;
+	uint64_t  new_freq;
+
 	pthread_mutex_t data_mutex;
 	pthread_cond_t  data_cond;
 
 	pthread_mutex_t client_lock;
 	int             client_count;
 	struct rtlsdr_client clients[RTLSTREAM_MAX_CLIENTS];
+
+	pthread_t       fft_thread;
+	struct fft_plan *fft_plan;
+	float          *fft_window;
+	float          *fft_in;
+	float          *fft_power;
+	int             fft_bins;
+	int             fft_step;
+	int             fft_accum;
+	int             fft_nsamples;
+	uint32_t        fft_read_pos;
+	uint32_t        fft_seq;
+	float          *fft_acc;
+
+	pthread_mutex_t fft_mutex;
+	pthread_cond_t  fft_cond;
+	int             fft_ready;
 };
 
 int rtlsdr_server_init(struct rtlsdr_server *srv, int iq_port, int fft_port,

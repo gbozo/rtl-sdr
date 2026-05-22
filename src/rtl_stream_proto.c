@@ -75,3 +75,16 @@ int rtlsdr_stream_encode_fft_hdr(unsigned char *buf, const struct rtlsdr_stream_
 	put32(buf + 24, hdr->bins);
 	return RTLSTREAM_FFT_HDR_SIZE;
 }
+
+int rtlsdr_stream_encode_evt(unsigned char *buf, uint32_t type, uint64_t freq)
+{
+	if (!buf)
+		return -1;
+	put32(buf, RTLSTREAM_MAGIC_EVT);
+	put32(buf + 4, type);
+	if (type == RTLSTREAM_EVT_FREQ_CHANGE) {
+		put64(buf + 8, freq);
+		return RTLSTREAM_EVT_FREQ_SIZE;
+	}
+	return RTLSTREAM_EVT_HDR_SIZE;
+}

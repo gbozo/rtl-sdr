@@ -65,6 +65,33 @@ static void *async_reader_thread(void *arg)
 	return NULL;
 }
 
+static void *freq_monitor(void *arg)
+{
+	(void)arg;
+	while (!do_exit) {
+		sleep(1);
+		if (g_dev) {
+			uint32_t current = rtlsdr_get_center_freq(g_dev);
+			if (current != 0 &&
+			    current != (uint32_t)g_server.capture_freq) {
+				fprintf(stderr, "rtl_stream: freq changed "
+					"from %u to %u, terminating streams\n",
+					(uint32_t)g_server.capture_freq,
+					current);
+				g_server.freq_changed = 1;
+				g_server.new_freq = current;
+				do_exit = 1;
+				rtlsdr_cancel_async(g_dev);
+				pthread_mutex_lock(&g_server.data_mutex);
+				pthread_cond_broadcast(&g_server.data_cond);
+				pthread_mutex_unlock(&g_server.data_mutex);
+				break;
+			}
+		}
+	}
+	return NULL;
+}
+
 static double parse_freq(const char *arg)
 {
 	char *end;
@@ -107,6 +134,7 @@ int main(int argc, char **argv)
 	int list_only = 0;
 	int opt;
 	pthread_t async_thread;
+	pthread_t monitor_thread;
 	struct rtlsdr_ring *ring = NULL;
 
 	static struct option long_options[] = {
@@ -152,8 +180,8 @@ int main(int argc, char **argv)
 				char vendor[256] = "", product[256] = "", serial[256] = "";
 				rtlsdr_get_device_usb_strings(i, vendor, product, serial);
 				printf("  %u:  %s", i, rtlsdr_get_device_name(i));
-				if (serial[0])
-					printf(", SN: %s", serial);
+				if ((int)i == dev_index)
+					printf(" (default)");
 				printf("\n");
 				if (vendor[0])
 					printf("       Manufacturer: %s\n", vendor);
@@ -164,6 +192,13 @@ int main(int argc, char **argv)
 				printf("\n");
 			}
 		}
+		printf("Configuration:\n");
+		printf("  I/Q port:  %d\n", iq_port);
+		printf("  FFT port:  %d", fft_port);
+		if (fft_port == 0)
+			printf(" (disabled)");
+		printf("\n");
+		printf("  Device:    %d\n", dev_index);
 		return 0;
 	}
 
@@ -201,11 +236,13 @@ int main(int argc, char **argv)
 		freq, sample_rate, iq_port, fft_port, dev_index);
 
 	pthread_create(&async_thread, NULL, async_reader_thread, g_dev);
+	pthread_create(&monitor_thread, NULL, freq_monitor, NULL);
 
 	rtlsdr_server_run(&g_server);
 
 	rtlsdr_cancel_async(g_dev);
 	pthread_join(async_thread, NULL);
+	pthread_join(monitor_thread, NULL);
 
 	rtlsdr_close(g_dev);
 	g_dev = NULL;
