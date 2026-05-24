@@ -61,6 +61,7 @@ int rtlsdr_stream_encode_iq_hdr(unsigned char *buf, const struct rtlsdr_stream_i
 	put64(buf + 4,  hdr->freq);
 	put64(buf + 12, hdr->rate);
 	put64(buf + 20, hdr->seq);
+	put32(buf + 28, hdr->nsamples);
 	return RTLSTREAM_IQ_HDR_SIZE;
 }
 
@@ -72,7 +73,7 @@ int rtlsdr_stream_encode_fft_hdr(unsigned char *buf, const struct rtlsdr_stream_
 	put64(buf + 4,  hdr->freq);
 	put64(buf + 12, hdr->rate);
 	put64(buf + 20, hdr->seq);
-	put32(buf + 24, hdr->bins);
+	put32(buf + 28, hdr->bins);
 	return RTLSTREAM_FFT_HDR_SIZE;
 }
 

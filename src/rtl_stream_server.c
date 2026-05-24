@@ -91,10 +91,11 @@ static void iq_client_handler(struct rtlsdr_client *cl)
 
 			if (out_len > 0) {
 				struct rtlsdr_stream_iq_hdr iq_hdr;
-				iq_hdr.magic = RTLSTREAM_MAGIC_IQ;
-				iq_hdr.freq  = cl->freq;
-				iq_hdr.rate  = cl->rate;
-				iq_hdr.seq   = seq++;
+				iq_hdr.magic    = RTLSTREAM_MAGIC_IQ;
+				iq_hdr.freq     = cl->freq;
+				iq_hdr.rate     = cl->rate;
+				iq_hdr.seq      = seq++;
+				iq_hdr.nsamples = (uint32_t)out_len;
 				rtlsdr_stream_encode_iq_hdr(hdr_buf, &iq_hdr);
 
 				if (send(cl->fd, hdr_buf,
@@ -372,7 +373,7 @@ int rtlsdr_server_init(struct rtlsdr_server *srv, int iq_port, int fft_port,
 			return -1;
 		}
 		srv->fft_window = fft_get_window(srv->fft_plan);
-		srv->fft_in  = (float *)calloc(srv->fft_bins * 2,
+		srv->fft_in  = (float *)calloc(srv->fft_step * 2,
 					       sizeof(float));
 		srv->fft_power = (float *)calloc(srv->fft_bins,
 						 sizeof(float));

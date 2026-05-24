@@ -144,3 +144,8 @@ float *fft_get_window(struct fft_plan *plan)
 {
 	return plan ? plan->window : NULL;
 }
+
+const char *fft_backend_name(void)
+{
+	return "CPU (radix-2 DIT Cooley-Tukey)";
+}

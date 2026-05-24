@@ -549,16 +549,19 @@ struct rtlsdr_dsp *rtlsdr_dsp_create(uint64_t input_rate,
 	R_total = (int)(input_rate / output_rate);
 	if (R_total < 1) R_total = 1;
 
-	if (bandwidth >= 1200000)	target_stages = 1;
-	else if (bandwidth >= 600000)	target_stages = 1;
-	else if (bandwidth >= 300000)	target_stages = 1;
-	else if (bandwidth >= 150000)	target_stages = 2;
-	else if (bandwidth >= 75000)	target_stages = 2;
-	else if (bandwidth >= 37000)	target_stages = 3;
-	else if (bandwidth >= 18000)	target_stages = 3;
-	else if (bandwidth >= 9000)	target_stages = 4;
-	else if (bandwidth >= 4000)	target_stages = 4;
-	else				target_stages = 5;
+	target_stages = 1;
+	if (R_total >= 2) {
+		if (bandwidth >= 1200000)      target_stages = 1;
+		else if (bandwidth >= 600000)  target_stages = 1;
+		else if (bandwidth >= 300000)  target_stages = 1;
+		else if (bandwidth >= 150000)  target_stages = 2;
+		else if (bandwidth >= 75000)   target_stages = 2;
+		else if (bandwidth >= 37000)   target_stages = 3;
+		else if (bandwidth >= 18000)   target_stages = 3;
+		else if (bandwidth >= 9000)    target_stages = 4;
+		else if (bandwidth >= 4000)    target_stages = 4;
+		else                           target_stages = 5;
+	}
 
 	/* Factor R_total across target_stages */
 	{

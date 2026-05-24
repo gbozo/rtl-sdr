@@ -22,6 +22,7 @@
 #include "rtl-sdr.h"
 #include "rtl_ring.h"
 #include "rtl_stream_server.h"
+#include "fft/fft_backend.h"
 
 #define RING_SLOT_COUNT  512
 #define RING_SLOT_SIZE   (256 * 1024)
@@ -75,13 +76,13 @@ static void *freq_monitor(void *arg)
 			if (current != 0 &&
 			    current != (uint32_t)g_server.capture_freq) {
 				fprintf(stderr, "rtl_stream: freq changed "
-					"from %u to %u, terminating streams\n",
+					"from %u to %u\n",
 					(uint32_t)g_server.capture_freq,
 					current);
 				g_server.freq_changed = 1;
 				g_server.new_freq = current;
-				do_exit = 1;
-				rtlsdr_cancel_async(g_dev);
+				g_server.capture_freq = current;
+				g_server.freq_changed = 0;
 				pthread_mutex_lock(&g_server.data_mutex);
 				pthread_cond_broadcast(&g_server.data_cond);
 				pthread_mutex_unlock(&g_server.data_mutex);
@@ -234,6 +235,7 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "rtl_stream: freq=%.0f rate=%.0f iq_port=%d fft_port=%d dev=%d\n",
 		freq, sample_rate, iq_port, fft_port, dev_index);
+	fprintf(stderr, "rtl_stream: FFT backend: %s\n", fft_backend_name());
 
 	pthread_create(&async_thread, NULL, async_reader_thread, g_dev);
 	pthread_create(&monitor_thread, NULL, freq_monitor, NULL);

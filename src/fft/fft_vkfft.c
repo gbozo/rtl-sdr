@@ -40,24 +40,30 @@ struct fft_plan {
 	VkBuffer stagingBuffer;
 	VkDeviceMemory stagingBufferMemory;
 	uint64_t stagingBufferSize;
+	uint64_t dataSize;
 
 	VkFFTApplication app;
 	int appInitialized;
 	int glslangInitialized;
 };
 
+static char g_gpu_name[256];
+
 static int find_queue_family(VkPhysicalDevice phys, VkQueueFlags flags)
 {
 	uint32_t count = 0;
+	VkQueueFamilyProperties *props;
+	int idx = -1;
+	uint32_t i;
+
 	vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, NULL);
 	if (!count)
 		return -1;
-	VkQueueFamilyProperties *props = (VkQueueFamilyProperties *)malloc(count * sizeof(*props));
+	props = (VkQueueFamilyProperties *)malloc(count * sizeof(*props));
 	if (!props)
 		return -1;
 	vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, props);
-	int idx = -1;
-	for (uint32_t i = 0; i < count; i++) {
+	for (i = 0; i < count; i++) {
 		if (props[i].queueCount > 0 && (props[i].queueFlags & flags)) {
 			idx = (int)i;
 			break;
@@ -71,8 +77,10 @@ static int find_memory_type(VkPhysicalDevice phys, uint32_t typeBits,
 			    VkMemoryPropertyFlags props, uint32_t *outIdx)
 {
 	VkPhysicalDeviceMemoryProperties memProps;
+	uint32_t i;
+
 	vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
-	for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+	for (i = 0; i < memProps.memoryTypeCount; i++) {
 		if ((typeBits & (1u << i)) &&
 		    (memProps.memoryTypes[i].propertyFlags & props) == props) {
 			*outIdx = i;
@@ -87,21 +95,26 @@ static int create_buffer(VkDevice dev, VkPhysicalDevice phys,
 			 VkMemoryPropertyFlags memProps,
 			 VkBuffer *outBuf, VkDeviceMemory *outMem)
 {
-	VkBufferCreateInfo ci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+	VkBufferCreateInfo ci;
+	VkMemoryRequirements req;
+	VkMemoryAllocateInfo ai;
+	uint32_t memType;
+
+	memset(&ci, 0, sizeof(ci));
+	ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	ci.size = size;
 	ci.usage = usage;
 	ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	if (vkCreateBuffer(dev, &ci, NULL, outBuf) != VK_SUCCESS)
 		return -1;
 
-	VkMemoryRequirements req;
 	vkGetBufferMemoryRequirements(dev, *outBuf, &req);
-	uint32_t memType;
 	if (find_memory_type(phys, req.memoryTypeBits, memProps, &memType) < 0) {
 		vkDestroyBuffer(dev, *outBuf, NULL);
 		return -1;
 	}
-	VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+	memset(&ai, 0, sizeof(ai));
+	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 	ai.allocationSize = req.size;
 	ai.memoryTypeIndex = memType;
 	if (vkAllocateMemory(dev, &ai, NULL, outMem) != VK_SUCCESS) {
@@ -116,28 +129,36 @@ static int copy_buffer(VkDevice dev, VkQueue queue, VkCommandPool pool,
 		       VkFence fence, VkBuffer src, VkBuffer dst,
 		       VkDeviceSize size)
 {
-	VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+	VkCommandBufferAllocateInfo ai;
+	VkCommandBuffer cmd;
+	VkCommandBufferBeginInfo bi;
+	VkBufferCopy region;
+	VkSubmitInfo si;
+	VkResult res;
+
+	memset(&ai, 0, sizeof(ai));
+	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	ai.commandPool = pool;
 	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd;
 	if (vkAllocateCommandBuffers(dev, &ai, &cmd) != VK_SUCCESS)
 		return -1;
 
-	VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+	memset(&bi, 0, sizeof(bi));
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd, &bi);
-	VkBufferCopy region;
 	region.srcOffset = 0;
 	region.dstOffset = 0;
 	region.size = size;
 	vkCmdCopyBuffer(cmd, src, dst, 1, &region);
 	vkEndCommandBuffer(cmd);
 
-	VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+	memset(&si, 0, sizeof(si));
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
-	VkResult res = vkQueueSubmit(queue, 1, &si, fence);
+	res = vkQueueSubmit(queue, 1, &si, fence);
 	if (res != VK_SUCCESS) {
 		vkFreeCommandBuffers(dev, pool, 1, &cmd);
 		return -1;
@@ -153,6 +174,19 @@ struct fft_plan *fft_plan_create(int nfft)
 	struct fft_plan *plan;
 	VkResult res;
 	int i;
+	VkApplicationInfo appInfo;
+	VkInstanceCreateInfo instCi;
+	uint32_t physCount;
+	VkPhysicalDevice *physDevs;
+	VkPhysicalDeviceProperties props;
+	int qfi;
+	float queuePriority;
+	VkDeviceQueueCreateInfo qCi;
+	VkDeviceCreateInfo devCi;
+	VkFenceCreateInfo fCi;
+	VkCommandPoolCreateInfo cpCi;
+	VkBufferUsageFlags bufUsage;
+	VkFFTConfiguration cfg;
 
 	if (nfft < 2 || nfft > FFT_MAX_NFFT)
 		return NULL;
@@ -168,46 +202,54 @@ struct fft_plan *fft_plan_create(int nfft)
 	for (i = 0; i < nfft; i++)
 		plan->window[i] = (float)bh_coeff(i, nfft);
 
-	plan->bufferSize = (uint64_t)nfft * 2 * sizeof(float);
+	plan->dataSize = (uint64_t)nfft * 2 * sizeof(float);
+	plan->bufferSize = plan->dataSize + 256 * 1024;
 	plan->stagingBufferSize = plan->bufferSize;
 
-	VkApplicationInfo appInfo = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+	memset(&appInfo, 0, sizeof(appInfo));
+	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
 	appInfo.pApplicationName = "rtl_stream";
 	appInfo.applicationVersion = 1;
 	appInfo.pEngineName = "rtl_stream";
 	appInfo.engineVersion = 1;
 	appInfo.apiVersion = VK_API_VERSION_1_0;
 
-	VkInstanceCreateInfo instCi = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+	memset(&instCi, 0, sizeof(instCi));
+	instCi.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 	instCi.pApplicationInfo = &appInfo;
 	instCi.enabledLayerCount = 0;
 	res = vkCreateInstance(&instCi, NULL, &plan->instance);
 	if (res != VK_SUCCESS)
 		goto fail;
 
-	uint32_t physCount = 0;
+	physCount = 0;
 	res = vkEnumeratePhysicalDevices(plan->instance, &physCount, NULL);
 	if (res != VK_SUCCESS || physCount == 0)
 		goto fail;
-	VkPhysicalDevice *physDevs = (VkPhysicalDevice *)malloc(physCount * sizeof(VkPhysicalDevice));
+	physDevs = (VkPhysicalDevice *)malloc(physCount * sizeof(VkPhysicalDevice));
 	if (!physDevs)
 		goto fail;
 	vkEnumeratePhysicalDevices(plan->instance, &physCount, physDevs);
 	plan->physicalDevice = physDevs[0];
 	free(physDevs);
 
-	int qfi = find_queue_family(plan->physicalDevice, VK_QUEUE_COMPUTE_BIT);
+	vkGetPhysicalDeviceProperties(plan->physicalDevice, &props);
+	snprintf(g_gpu_name, sizeof(g_gpu_name), "%s", props.deviceName);
+
+	qfi = find_queue_family(plan->physicalDevice, VK_QUEUE_COMPUTE_BIT);
 	if (qfi < 0)
 		goto fail;
 	plan->queueFamilyIndex = (uint32_t)qfi;
 
-	float queuePriority = 1.0f;
-	VkDeviceQueueCreateInfo qCi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+	queuePriority = 1.0f;
+	memset(&qCi, 0, sizeof(qCi));
+	qCi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 	qCi.queueFamilyIndex = plan->queueFamilyIndex;
 	qCi.queueCount = 1;
 	qCi.pQueuePriorities = &queuePriority;
 
-	VkDeviceCreateInfo devCi = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+	memset(&devCi, 0, sizeof(devCi));
+	devCi.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 	devCi.queueCreateInfoCount = 1;
 	devCi.pQueueCreateInfos = &qCi;
 	res = vkCreateDevice(plan->physicalDevice, &devCi, NULL, &plan->device);
@@ -216,19 +258,21 @@ struct fft_plan *fft_plan_create(int nfft)
 
 	vkGetDeviceQueue(plan->device, plan->queueFamilyIndex, 0, &plan->queue);
 
-	VkFenceCreateInfo fCi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	memset(&fCi, 0, sizeof(fCi));
+	fCi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 	res = vkCreateFence(plan->device, &fCi, NULL, &plan->fence);
 	if (res != VK_SUCCESS)
 		goto fail;
 
-	VkCommandPoolCreateInfo cpCi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+	memset(&cpCi, 0, sizeof(cpCi));
+	cpCi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 	cpCi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 	cpCi.queueFamilyIndex = plan->queueFamilyIndex;
 	res = vkCreateCommandPool(plan->device, &cpCi, NULL, &plan->commandPool);
 	if (res != VK_SUCCESS)
 		goto fail;
 
-	VkBufferUsageFlags bufUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	bufUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 		VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	if (create_buffer(plan->device, plan->physicalDevice, plan->bufferSize,
 			  bufUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -245,7 +289,7 @@ struct fft_plan *fft_plan_create(int nfft)
 		glslang_initialize_process();
 	}
 
-	VkFFTConfiguration cfg = {0};
+	memset(&cfg, 0, sizeof(cfg));
 	cfg.FFTdim = 1;
 	cfg.size[0] = (pfUINT)nfft;
 	cfg.numberBatches = 1;
@@ -304,44 +348,39 @@ void fft_plan_destroy(struct fft_plan *plan)
 	free(plan);
 }
 
-static void apply_window(struct fft_plan *plan, const float *in)
+void fft_execute(struct fft_plan *plan, const float *in, float *out)
 {
-	int n = plan->nfft;
 	void *data;
+	VkCommandBufferAllocateInfo ai;
+	VkCommandBuffer cmd;
+	VkCommandBufferBeginInfo bi;
+	VkFFTLaunchParams lp;
+	VkSubmitInfo si;
+
 	if (vkMapMemory(plan->device, plan->stagingBufferMemory, 0,
 			plan->stagingBufferSize, 0, &data) != VK_SUCCESS)
 		return;
-	float *dst = (float *)data;
-	for (int i = 0; i < n; i++) {
-		dst[2 * i]     = in[2 * i]     * plan->window[i];
-		dst[2 * i + 1] = in[2 * i + 1] * plan->window[i];
-	}
+	memcpy(data, in, plan->dataSize);
 	vkUnmapMemory(plan->device, plan->stagingBufferMemory);
-}
-
-void fft_execute(struct fft_plan *plan, const float *in, float *out)
-{
-	int n = plan->nfft;
-
-	apply_window(plan, in);
 
 	if (copy_buffer(plan->device, plan->queue, plan->commandPool, plan->fence,
-			plan->stagingBuffer, plan->buffer, plan->bufferSize) < 0)
+			plan->stagingBuffer, plan->buffer, plan->dataSize) < 0)
 		return;
 
-	VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+	memset(&ai, 0, sizeof(ai));
+	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	ai.commandPool = plan->commandPool;
 	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd;
 	if (vkAllocateCommandBuffers(plan->device, &ai, &cmd) != VK_SUCCESS)
 		return;
 
-	VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+	memset(&bi, 0, sizeof(bi));
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(cmd, &bi);
 
-	VkFFTLaunchParams lp = {0};
+	memset(&lp, 0, sizeof(lp));
 	lp.commandBuffer = &cmd;
 	lp.buffer = &plan->buffer;
 
@@ -352,7 +391,8 @@ void fft_execute(struct fft_plan *plan, const float *in, float *out)
 
 	vkEndCommandBuffer(cmd);
 
-	VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+	memset(&si, 0, sizeof(si));
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
 	if (vkQueueSubmit(plan->queue, 1, &si, plan->fence) == VK_SUCCESS) {
@@ -362,13 +402,12 @@ void fft_execute(struct fft_plan *plan, const float *in, float *out)
 	vkFreeCommandBuffers(plan->device, plan->commandPool, 1, &cmd);
 
 	if (copy_buffer(plan->device, plan->queue, plan->commandPool, plan->fence,
-			plan->buffer, plan->stagingBuffer, plan->bufferSize) < 0)
+			plan->buffer, plan->stagingBuffer, plan->dataSize) < 0)
 		return;
 
-	void *data;
 	if (vkMapMemory(plan->device, plan->stagingBufferMemory, 0,
-			plan->stagingBufferSize, 0, &data) == VK_SUCCESS) {
-		memcpy(out, data, plan->stagingBufferSize);
+			plan->dataSize, 0, &data) == VK_SUCCESS) {
+		memcpy(out, data, plan->dataSize);
 		vkUnmapMemory(plan->device, plan->stagingBufferMemory);
 	}
 }
@@ -376,6 +415,11 @@ void fft_execute(struct fft_plan *plan, const float *in, float *out)
 float *fft_get_window(struct fft_plan *plan)
 {
 	return plan ? plan->window : NULL;
+}
+
+const char *fft_backend_name(void)
+{
+	return g_gpu_name[0] ? g_gpu_name : "Vulkan";
 }
 
 #else
@@ -386,4 +430,5 @@ void fft_plan_destroy(struct fft_plan *plan) { (void)plan; }
 void fft_execute(struct fft_plan *plan, const float *in, float *out)
 { (void)plan; (void)in; (void)out; }
 float *fft_get_window(struct fft_plan *plan) { (void)plan; return NULL; }
+const char *fft_backend_name(void) { return "Vulkan (stub - not compiled)"; }
 #endif

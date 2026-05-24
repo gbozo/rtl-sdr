@@ -12,8 +12,8 @@
 #define RTLSTREAM_MODE_FFT 1
 
 #define RTLSTREAM_REQ_SIZE       29
-#define RTLSTREAM_IQ_HDR_SIZE    24
-#define RTLSTREAM_FFT_HDR_SIZE   28
+#define RTLSTREAM_IQ_HDR_SIZE    32
+#define RTLSTREAM_FFT_HDR_SIZE   32
 #define RTLSTREAM_EVT_HDR_SIZE    8
 #define RTLSTREAM_EVT_FREQ_SIZE  16
 
@@ -33,6 +33,7 @@ struct rtlsdr_stream_iq_hdr {
 	uint64_t freq;
 	uint64_t rate;
 	uint64_t seq;
+	uint32_t nsamples;
 };
 
 struct rtlsdr_stream_fft_hdr {

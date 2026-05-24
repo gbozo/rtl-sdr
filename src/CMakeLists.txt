@@ -149,9 +149,11 @@ if(ENABLE_VKFFT)
         ${VULKAN_TARGET}
     )
     target_include_directories(rtl_stream PRIVATE
+        /usr/include/glslang/Include
+    )
+    target_include_directories(rtl_stream SYSTEM PRIVATE
         ${vkfft_SOURCE_DIR}
         ${vkfft_SOURCE_DIR}/vkFFT
-        /usr/include/glslang/Include
     )
     target_compile_definitions(rtl_stream PRIVATE HAVE_VKFFT VKFFT_BACKEND=0)
 
