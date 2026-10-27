@@ -46,3 +46,4 @@ CMakeFiles
 build/
 build-novkfft/
 build-vkfft/
+build-*/
