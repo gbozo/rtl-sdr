@@ -1,434 +1,413 @@
-#ifdef HAVE_VKFFT
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <math.h>
-
-#include "vulkan/vulkan.h"
-#include "glslang_c_interface.h"
-#include "vkFFT/vkFFT.h"
+#include <locale.h>
+#include <pthread.h>
+#include <time.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+#include <vulkan/vulkan.h>
+#include <glslang_c_interface.h>
+#include <vkFFT/vkFFT.h>
 #include "fft_backend.h"
 
-#define FFT_MAX_NFFT 16384
-
-static double bh_coeff(int n, int N)
-{
-	double a0 = 0.35875;
-	double a1 = 0.48829;
-	double a2 = 0.14128;
-	double a3 = 0.01168;
-	double x = 2.0 * M_PI * n / (N - 1);
-	return a0 - a1 * cos(x) + a2 * cos(2.0 * x) - a3 * cos(3.0 * x);
-}
-
 struct fft_plan {
-	int nfft;
+	int nfft, failed, pending, app_initialized;
 	float *window;
-
 	VkInstance instance;
-	VkPhysicalDevice physicalDevice;
+	VkPhysicalDevice physical;
 	VkDevice device;
 	VkQueue queue;
-	uint32_t queueFamilyIndex;
 	VkFence fence;
-	VkCommandPool commandPool;
-
-	VkBuffer buffer;
-	VkDeviceMemory bufferMemory;
-	uint64_t bufferSize;
-
-	VkBuffer stagingBuffer;
-	VkDeviceMemory stagingBufferMemory;
-	uint64_t stagingBufferSize;
-	uint64_t dataSize;
-
+	VkCommandPool pool;
+	VkCommandBuffer command;
+	VkBuffer buffer, staging;
+	VkDeviceMemory memory, staging_memory;
+	void *mapped;
+	/* VkFFT retains these addresses, including the launch command address. */
+	pfUINT bytes;
 	VkFFTApplication app;
-	int appInitialized;
-	int glslangInitialized;
 };
 
-static char g_gpu_name[256];
+/* Process lifetime ownership: never finalize glslang out from under other users.
+ * Plan compilation is serialized; locale changes affect only this thread. */
+static pthread_once_t compiler_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t compiler_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int compiler_ready;
 
-static int find_queue_family(VkPhysicalDevice phys, VkQueueFlags flags)
+static void compiler_init(void)
 {
-	uint32_t count = 0;
-	VkQueueFamilyProperties *props;
-	int idx = -1;
-	uint32_t i;
-
-	vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, NULL);
-	if (!count)
-		return -1;
-	props = (VkQueueFamilyProperties *)malloc(count * sizeof(*props));
-	if (!props)
-		return -1;
-	vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, props);
-	for (i = 0; i < count; i++) {
-		if (props[i].queueCount > 0 && (props[i].queueFlags & flags)) {
-			idx = (int)i;
-			break;
-		}
-	}
-	free(props);
-	return idx;
+	compiler_ready = glslang_initialize_process();
 }
 
-static int find_memory_type(VkPhysicalDevice phys, uint32_t typeBits,
-			    VkMemoryPropertyFlags props, uint32_t *outIdx)
+static int memory_type(VkPhysicalDevice physical, uint32_t bits,
+	VkMemoryPropertyFlags flags, uint32_t *index)
 {
-	VkPhysicalDeviceMemoryProperties memProps;
-	uint32_t i;
-
-	vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
-	for (i = 0; i < memProps.memoryTypeCount; i++) {
-		if ((typeBits & (1u << i)) &&
-		    (memProps.memoryTypes[i].propertyFlags & props) == props) {
-			*outIdx = i;
+	VkPhysicalDeviceMemoryProperties properties;
+	vkGetPhysicalDeviceMemoryProperties(physical, &properties);
+	for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+		if ((bits & (1u << i)) &&
+		    (properties.memoryTypes[i].propertyFlags & flags) == flags) {
+			*index = i;
 			return 0;
 		}
 	}
 	return -1;
 }
 
-static int create_buffer(VkDevice dev, VkPhysicalDevice phys,
-			 VkDeviceSize size, VkBufferUsageFlags usage,
-			 VkMemoryPropertyFlags memProps,
-			 VkBuffer *outBuf, VkDeviceMemory *outMem)
+/* Ownership transfers only on full success; failure leaves both outputs zero. */
+static int create_buffer(struct fft_plan *p, VkBufferUsageFlags usage,
+	VkMemoryPropertyFlags flags, VkBuffer *out, VkDeviceMemory *out_memory)
 {
-	VkBufferCreateInfo ci;
-	VkMemoryRequirements req;
-	VkMemoryAllocateInfo ai;
-	uint32_t memType;
-
-	memset(&ci, 0, sizeof(ci));
-	ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	ci.size = size;
-	ci.usage = usage;
-	ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	if (vkCreateBuffer(dev, &ci, NULL, outBuf) != VK_SUCCESS)
+	VkBuffer buffer = VK_NULL_HANDLE;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	VkBufferCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = p->bytes, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+	VkMemoryRequirements requirements;
+	VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+	if (vkCreateBuffer(p->device, &ci, NULL, &buffer) != VK_SUCCESS)
 		return -1;
-
-	vkGetBufferMemoryRequirements(dev, *outBuf, &req);
-	if (find_memory_type(phys, req.memoryTypeBits, memProps, &memType) < 0) {
-		vkDestroyBuffer(dev, *outBuf, NULL);
-		return -1;
+	vkGetBufferMemoryRequirements(p->device, buffer, &requirements);
+	ai.allocationSize = requirements.size;
+	if (memory_type(p->physical, requirements.memoryTypeBits, flags,
+		&ai.memoryTypeIndex) < 0)
+		goto fail;
+	if (vkAllocateMemory(p->device, &ai, NULL, &memory) != VK_SUCCESS) {
+		memory = VK_NULL_HANDLE; /* An unsuccessful call transfers no ownership. */
+		goto fail;
 	}
-	memset(&ai, 0, sizeof(ai));
-	ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	ai.allocationSize = req.size;
-	ai.memoryTypeIndex = memType;
-	if (vkAllocateMemory(dev, &ai, NULL, outMem) != VK_SUCCESS) {
-		vkDestroyBuffer(dev, *outBuf, NULL);
-		return -1;
-	}
-	vkBindBufferMemory(dev, *outBuf, *outMem, 0);
+	if (vkBindBufferMemory(p->device, buffer, memory, 0) != VK_SUCCESS)
+		goto fail;
+	*out = buffer;
+	*out_memory = memory;
 	return 0;
+fail:
+	vkDestroyBuffer(p->device, buffer, NULL);
+	if (memory)
+		vkFreeMemory(p->device, memory, NULL);
+	return -1;
 }
 
-static int copy_buffer(VkDevice dev, VkQueue queue, VkCommandPool pool,
-		       VkFence fence, VkBuffer src, VkBuffer dst,
-		       VkDeviceSize size)
+static int extension_present(VkPhysicalDevice physical, const char *name)
 {
-	VkCommandBufferAllocateInfo ai;
-	VkCommandBuffer cmd;
-	VkCommandBufferBeginInfo bi;
-	VkBufferCopy region;
-	VkSubmitInfo si;
-	VkResult res;
-
-	memset(&ai, 0, sizeof(ai));
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	if (vkAllocateCommandBuffers(dev, &ai, &cmd) != VK_SUCCESS)
+	uint32_t count = 0;
+	VkExtensionProperties *extensions;
+	VkResult result;
+	int found = 0;
+	result = physical ? vkEnumerateDeviceExtensionProperties(physical, NULL, &count, NULL) :
+		vkEnumerateInstanceExtensionProperties(NULL, &count, NULL);
+	if (result != VK_SUCCESS)
 		return -1;
-
-	memset(&bi, 0, sizeof(bi));
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-	region.srcOffset = 0;
-	region.dstOffset = 0;
-	region.size = size;
-	vkCmdCopyBuffer(cmd, src, dst, 1, &region);
-	vkEndCommandBuffer(cmd);
-
-	memset(&si, 0, sizeof(si));
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	res = vkQueueSubmit(queue, 1, &si, fence);
-	if (res != VK_SUCCESS) {
-		vkFreeCommandBuffers(dev, pool, 1, &cmd);
+	extensions = calloc(count ? count : 1, sizeof(*extensions));
+	if (!extensions)
 		return -1;
+	result = physical ? vkEnumerateDeviceExtensionProperties(physical, NULL, &count, extensions) :
+		vkEnumerateInstanceExtensionProperties(NULL, &count, extensions);
+	if (result == VK_SUCCESS) {
+		for (uint32_t i = 0; i < count; i++)
+			if (!strcmp(extensions[i].extensionName, name))
+				found = 1;
+	} else {
+		found = -1;
 	}
-	vkWaitForFences(dev, 1, &fence, VK_TRUE, 100000000000ULL);
-	vkResetFences(dev, 1, &fence);
-	vkFreeCommandBuffers(dev, pool, 1, &cmd);
-	return 0;
+	free(extensions);
+	return found;
+}
+
+static int create_device(struct fft_plan *p, VkPhysicalDevice physical, uint32_t *family)
+{
+	uint32_t count = 0, memory_index;
+	VkQueueFamilyProperties *properties;
+	VkDevice device;
+	float priority = 1;
+	const char *portability = "VK_KHR_portability_subset";
+	int portable = extension_present(physical, portability), result = -1;
+	VkDeviceQueueCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+		.queueCount = 1, .pQueuePriorities = &priority };
+	VkDeviceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+		.queueCreateInfoCount = 1, .pQueueCreateInfos = &qi };
+	if (portable < 0 || memory_type(physical, UINT32_MAX,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&memory_index) < 0 || memory_type(physical, UINT32_MAX,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_index) < 0)
+		return -1;
+	if (portable) {
+		ci.enabledExtensionCount = 1;
+		ci.ppEnabledExtensionNames = &portability;
+	}
+	vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, NULL);
+	properties = calloc(count ? count : 1, sizeof(*properties));
+	if (!properties)
+		return -1;
+	vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, properties);
+	for (uint32_t i = 0; i < count; i++) {
+		if (!properties[i].queueCount || !(properties[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
+			continue;
+		qi.queueFamilyIndex = i;
+		if (vkCreateDevice(physical, &ci, NULL, &device) == VK_SUCCESS) {
+			p->device = device;
+			p->physical = physical;
+			*family = i;
+			vkGetDeviceQueue(p->device, i, 0, &p->queue);
+			result = 0;
+			break;
+		}
+	}
+	free(properties);
+	return result;
+}
+
+/* A timeout is NOT cancellation. Never release resources still in use.
+ * Other wait errors poison the plan but require an idle/lost-device result
+ * before cleanup. This can wait indefinitely on a broken driver. */
+static int complete_submission(struct fft_plan *p)
+{
+	VkResult result;
+	if (!p->pending)
+		return 0;
+	result = vkWaitForFences(p->device, 1, &p->fence, VK_TRUE, UINT64_MAX);
+	if (result != VK_SUCCESS) {
+		p->failed = 1;
+		if (result != VK_ERROR_DEVICE_LOST) {
+			do {
+				const struct timespec pause = {0, 1000000};
+				result = vkDeviceWaitIdle(p->device);
+				if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST)
+					nanosleep(&pause, NULL);
+			} while (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST);
+		}
+	}
+	p->pending = 0;
+	return p->failed ? -1 : 0;
 }
 
 struct fft_plan *fft_plan_create(int nfft)
 {
-	struct fft_plan *plan;
-	VkResult res;
-	int i;
-	VkApplicationInfo appInfo;
-	VkInstanceCreateInfo instCi;
-	uint32_t physCount;
-	VkPhysicalDevice *physDevs;
-	VkPhysicalDeviceProperties props;
-	int qfi;
-	float queuePriority;
-	VkDeviceQueueCreateInfo qCi;
-	VkDeviceCreateInfo devCi;
-	VkFenceCreateInfo fCi;
-	VkCommandPoolCreateInfo cpCi;
-	VkBufferUsageFlags bufUsage;
-	VkFFTConfiguration cfg;
-
-	if (nfft < 2 || nfft > FFT_MAX_NFFT)
+	struct fft_plan *p;
+	uint32_t count = 0, family = 0;
+	VkPhysicalDevice *devices = NULL;
+	const char *portability = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+	const char *instance_extensions[] = { VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+		VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME };
+	int portable;
+	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+		.pApplicationName = "rtl_stream", .apiVersion = VK_API_VERSION_1_0 };
+	VkInstanceCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.pApplicationInfo = &app };
+	VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	VkCommandPoolCreateInfo pi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
+	VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+	VkFFTConfiguration config = {0};
+	VkFFTResult initialized;
+	locale_t locale, previous;
+	if (nfft < 2 || nfft > 16384 || (nfft & (nfft - 1)))
 		return NULL;
-
-	plan = (struct fft_plan *)calloc(1, sizeof(*plan));
-	if (!plan)
+	p = calloc(1, sizeof(*p));
+	if (!p)
 		return NULL;
-
-	plan->nfft = nfft;
-	plan->window = (float *)malloc(nfft * sizeof(float));
-	if (!plan->window)
+	p->nfft = nfft;
+	p->bytes = (pfUINT)nfft * 2 * sizeof(float);
+	p->window = malloc((size_t)nfft * sizeof(float));
+	if (!p->window)
 		goto fail;
-	for (i = 0; i < nfft; i++)
-		plan->window[i] = (float)bh_coeff(i, nfft);
-
-	plan->dataSize = (uint64_t)nfft * 2 * sizeof(float);
-	plan->bufferSize = plan->dataSize + 256 * 1024;
-	plan->stagingBufferSize = plan->bufferSize;
-
-	memset(&appInfo, 0, sizeof(appInfo));
-	appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-	appInfo.pApplicationName = "rtl_stream";
-	appInfo.applicationVersion = 1;
-	appInfo.pEngineName = "rtl_stream";
-	appInfo.engineVersion = 1;
-	appInfo.apiVersion = VK_API_VERSION_1_0;
-
-	memset(&instCi, 0, sizeof(instCi));
-	instCi.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-	instCi.pApplicationInfo = &appInfo;
-	instCi.enabledLayerCount = 0;
-	res = vkCreateInstance(&instCi, NULL, &plan->instance);
-	if (res != VK_SUCCESS)
-		goto fail;
-
-	physCount = 0;
-	res = vkEnumeratePhysicalDevices(plan->instance, &physCount, NULL);
-	if (res != VK_SUCCESS || physCount == 0)
-		goto fail;
-	physDevs = (VkPhysicalDevice *)malloc(physCount * sizeof(VkPhysicalDevice));
-	if (!physDevs)
-		goto fail;
-	vkEnumeratePhysicalDevices(plan->instance, &physCount, physDevs);
-	plan->physicalDevice = physDevs[0];
-	free(physDevs);
-
-	vkGetPhysicalDeviceProperties(plan->physicalDevice, &props);
-	snprintf(g_gpu_name, sizeof(g_gpu_name), "%s", props.deviceName);
-
-	qfi = find_queue_family(plan->physicalDevice, VK_QUEUE_COMPUTE_BIT);
-	if (qfi < 0)
-		goto fail;
-	plan->queueFamilyIndex = (uint32_t)qfi;
-
-	queuePriority = 1.0f;
-	memset(&qCi, 0, sizeof(qCi));
-	qCi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-	qCi.queueFamilyIndex = plan->queueFamilyIndex;
-	qCi.queueCount = 1;
-	qCi.pQueuePriorities = &queuePriority;
-
-	memset(&devCi, 0, sizeof(devCi));
-	devCi.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-	devCi.queueCreateInfoCount = 1;
-	devCi.pQueueCreateInfos = &qCi;
-	res = vkCreateDevice(plan->physicalDevice, &devCi, NULL, &plan->device);
-	if (res != VK_SUCCESS)
-		goto fail;
-
-	vkGetDeviceQueue(plan->device, plan->queueFamilyIndex, 0, &plan->queue);
-
-	memset(&fCi, 0, sizeof(fCi));
-	fCi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	res = vkCreateFence(plan->device, &fCi, NULL, &plan->fence);
-	if (res != VK_SUCCESS)
-		goto fail;
-
-	memset(&cpCi, 0, sizeof(cpCi));
-	cpCi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	cpCi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	cpCi.queueFamilyIndex = plan->queueFamilyIndex;
-	res = vkCreateCommandPool(plan->device, &cpCi, NULL, &plan->commandPool);
-	if (res != VK_SUCCESS)
-		goto fail;
-
-	bufUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-		VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	if (create_buffer(plan->device, plan->physicalDevice, plan->bufferSize,
-			  bufUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-			  &plan->buffer, &plan->bufferMemory) < 0)
-		goto fail;
-	if (create_buffer(plan->device, plan->physicalDevice, plan->stagingBufferSize,
-			  bufUsage,
-			  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			  &plan->stagingBuffer, &plan->stagingBufferMemory) < 0)
-		goto fail;
-
-	if (!plan->glslangInitialized) {
-		plan->glslangInitialized = 1;
-		glslang_initialize_process();
+	for (int i = 0; i < nfft; i++) {
+		double x = 2 * M_PI * i / (nfft - 1);
+		p->window[i] = (float)(0.35875 - 0.48829*cos(x) + 0.14128*cos(2*x) - 0.01168*cos(3*x));
 	}
-
-	memset(&cfg, 0, sizeof(cfg));
-	cfg.FFTdim = 1;
-	cfg.size[0] = (pfUINT)nfft;
-	cfg.numberBatches = 1;
-	cfg.makeForwardPlanOnly = 1;
-	cfg.physicalDevice = &plan->physicalDevice;
-	cfg.device = &plan->device;
-	cfg.queue = &plan->queue;
-	cfg.commandPool = &plan->commandPool;
-	cfg.fence = &plan->fence;
-	cfg.isCompilerInitialized = 1;
-	cfg.buffer = &plan->buffer;
-	cfg.bufferSize = &plan->bufferSize;
-
-	memset(&plan->app, 0, sizeof(plan->app));
-	if (initializeVkFFT(&plan->app, cfg) != VKFFT_SUCCESS)
+	portable = extension_present(VK_NULL_HANDLE, portability);
+	if (portable < 0)
 		goto fail;
-	plan->appInitialized = 1;
-
-	return plan;
-
+	if (portable) {
+		/* portability_subset depends on this instance extension in Vulkan 1.0. */
+		if (extension_present(VK_NULL_HANDLE, instance_extensions[1]) != 1)
+			goto fail;
+		ii.enabledExtensionCount = 2;
+		ii.ppEnabledExtensionNames = instance_extensions;
+		ii.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+	}
+	if (vkCreateInstance(&ii, NULL, &p->instance) != VK_SUCCESS) {
+		p->instance = VK_NULL_HANDLE;
+		goto fail;
+	}
+	if (vkEnumeratePhysicalDevices(p->instance, &count, NULL) != VK_SUCCESS || !count)
+		goto fail;
+	devices = calloc(count, sizeof(*devices));
+	if (!devices || vkEnumeratePhysicalDevices(p->instance, &count, devices) != VK_SUCCESS)
+		goto fail;
+	for (uint32_t i = 0; i < count; i++)
+		if (create_device(p, devices[i], &family) == 0)
+			break;
+	free(devices);
+	devices = NULL;
+	if (!p->device)
+		goto fail;
+	pi.queueFamilyIndex = family;
+	if (vkCreateFence(p->device, &fi, NULL, &p->fence) != VK_SUCCESS) {
+		p->fence = VK_NULL_HANDLE;
+		goto fail;
+	}
+	if (vkCreateCommandPool(p->device, &pi, NULL, &p->pool) != VK_SUCCESS) {
+		p->pool = VK_NULL_HANDLE;
+		goto fail;
+	}
+	ai.commandPool = p->pool;
+	if (vkAllocateCommandBuffers(p->device, &ai, &p->command) != VK_SUCCESS) {
+		p->command = VK_NULL_HANDLE;
+		goto fail;
+	}
+	if (create_buffer(p, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+		VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		&p->buffer, &p->memory) < 0 ||
+	    create_buffer(p, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&p->staging, &p->staging_memory) < 0)
+		goto fail;
+	if (vkMapMemory(p->device, p->staging_memory, 0, p->bytes, 0, &p->mapped) != VK_SUCCESS) {
+		p->mapped = NULL;
+		goto fail;
+	}
+	config.FFTdim = 1;
+	config.size[0] = (pfUINT)nfft;
+	config.makeForwardPlanOnly = 1;
+	/* Precomputed twiddles avoid device sin/cos accuracy differences, especially
+	 * near zero components of large complex tones. See upstream timeout caveat
+	 * in docs/rtl_stream.md: LUT uploads occur inside initializeVkFFT. */
+	config.useLUT = 1;
+	config.physicalDevice = &p->physical;
+	config.device = &p->device;
+	config.queue = &p->queue;
+	config.commandPool = &p->pool;
+	config.fence = &p->fence;
+	config.buffer = &p->buffer;
+	config.bufferSize = &p->bytes;
+	config.isCompilerInitialized = 1;
+	config.disableSetLocale = 1;
+	locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+	if (!locale)
+		goto fail;
+	previous = uselocale(locale);
+	if (!previous) {
+		freelocale(locale);
+		goto fail;
+	}
+	pthread_once(&compiler_once, compiler_init);
+	pthread_mutex_lock(&compiler_mutex);
+	initialized = compiler_ready ? initializeVkFFT(&p->app, config) : VKFFT_ERROR_FAILED_TO_INITIALIZE;
+	pthread_mutex_unlock(&compiler_mutex);
+	uselocale(previous);
+	freelocale(locale);
+	if (initialized != VKFFT_SUCCESS) {
+		fprintf(stderr, "VkFFT initialization failed: %d\n", (int)initialized);
+		goto fail;
+	}
+	p->app_initialized = 1;
+	return p;
 fail:
-	fft_plan_destroy(plan);
+	free(devices);
+	fft_plan_destroy(p);
 	return NULL;
 }
 
-void fft_plan_destroy(struct fft_plan *plan)
+void fft_plan_destroy(struct fft_plan *p)
 {
-	if (!plan)
+	if (!p)
 		return;
-
-	if (plan->appInitialized)
-		deleteVkFFT(&plan->app);
-
-	if (plan->device) {
-		if (plan->buffer)
-			vkDestroyBuffer(plan->device, plan->buffer, NULL);
-		if (plan->bufferMemory)
-			vkFreeMemory(plan->device, plan->bufferMemory, NULL);
-		if (plan->stagingBuffer)
-			vkDestroyBuffer(plan->device, plan->stagingBuffer, NULL);
-		if (plan->stagingBufferMemory)
-			vkFreeMemory(plan->device, plan->stagingBufferMemory, NULL);
-		if (plan->commandPool)
-			vkDestroyCommandPool(plan->device, plan->commandPool, NULL);
-		if (plan->fence)
-			vkDestroyFence(plan->device, plan->fence, NULL);
-		vkDestroyDevice(plan->device, NULL);
+	complete_submission(p);
+	if (p->app_initialized)
+		deleteVkFFT(&p->app);
+	if (p->device) {
+		if (p->mapped)
+			vkUnmapMemory(p->device, p->staging_memory);
+		if (p->buffer)
+			vkDestroyBuffer(p->device, p->buffer, NULL);
+		if (p->memory)
+			vkFreeMemory(p->device, p->memory, NULL);
+		if (p->staging)
+			vkDestroyBuffer(p->device, p->staging, NULL);
+		if (p->staging_memory)
+			vkFreeMemory(p->device, p->staging_memory, NULL);
+		if (p->pool)
+			vkDestroyCommandPool(p->device, p->pool, NULL);
+		if (p->fence)
+			vkDestroyFence(p->device, p->fence, NULL);
+		vkDestroyDevice(p->device, NULL);
 	}
-	if (plan->instance)
-		vkDestroyInstance(plan->instance, NULL);
-
-	if (plan->glslangInitialized)
-		glslang_finalize_process();
-
-	free(plan->window);
-	free(plan);
+	if (p->instance)
+		vkDestroyInstance(p->instance, NULL);
+	free(p->window);
+	free(p);
 }
 
-void fft_execute(struct fft_plan *plan, const float *in, float *out)
+static void barrier(struct fft_plan *p, VkBuffer buffer, VkPipelineStageFlags src,
+	VkAccessFlags read, VkPipelineStageFlags dst, VkAccessFlags write)
 {
-	void *data;
-	VkCommandBufferAllocateInfo ai;
-	VkCommandBuffer cmd;
-	VkCommandBufferBeginInfo bi;
-	VkFFTLaunchParams lp;
-	VkSubmitInfo si;
-
-	if (vkMapMemory(plan->device, plan->stagingBufferMemory, 0,
-			plan->stagingBufferSize, 0, &data) != VK_SUCCESS)
-		return;
-	memcpy(data, in, plan->dataSize);
-	vkUnmapMemory(plan->device, plan->stagingBufferMemory);
-
-	if (copy_buffer(plan->device, plan->queue, plan->commandPool, plan->fence,
-			plan->stagingBuffer, plan->buffer, plan->dataSize) < 0)
-		return;
-
-	memset(&ai, 0, sizeof(ai));
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = plan->commandPool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	if (vkAllocateCommandBuffers(plan->device, &ai, &cmd) != VK_SUCCESS)
-		return;
-
-	memset(&bi, 0, sizeof(bi));
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
-
-	memset(&lp, 0, sizeof(lp));
-	lp.commandBuffer = &cmd;
-	lp.buffer = &plan->buffer;
-
-	if (VkFFTAppend(&plan->app, -1, &lp) != VKFFT_SUCCESS) {
-		vkFreeCommandBuffers(plan->device, plan->commandPool, 1, &cmd);
-		return;
-	}
-
-	vkEndCommandBuffer(cmd);
-
-	memset(&si, 0, sizeof(si));
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	if (vkQueueSubmit(plan->queue, 1, &si, plan->fence) == VK_SUCCESS) {
-		vkWaitForFences(plan->device, 1, &plan->fence, VK_TRUE, 100000000000ULL);
-		vkResetFences(plan->device, 1, &plan->fence);
-	}
-	vkFreeCommandBuffers(plan->device, plan->commandPool, 1, &cmd);
-
-	if (copy_buffer(plan->device, plan->queue, plan->commandPool, plan->fence,
-			plan->buffer, plan->stagingBuffer, plan->dataSize) < 0)
-		return;
-
-	if (vkMapMemory(plan->device, plan->stagingBufferMemory, 0,
-			plan->dataSize, 0, &data) == VK_SUCCESS) {
-		memcpy(out, data, plan->dataSize);
-		vkUnmapMemory(plan->device, plan->stagingBufferMemory);
-	}
+	VkBufferMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask = read, .dstAccessMask = write,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.buffer = buffer, .size = p->bytes };
+	vkCmdPipelineBarrier(p->command, src, dst, 0, 0, NULL, 1, &b, 0, NULL);
 }
 
-float *fft_get_window(struct fft_plan *plan)
+int fft_execute(struct fft_plan *p, const float *in, float *out)
 {
-	return plan ? plan->window : NULL;
+	uintptr_t a = (uintptr_t)in, b = (uintptr_t)out;
+	VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+	VkBufferCopy copy = {0};
+	VkFFTLaunchParams launch = {0};
+	VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1 };
+	if (!p || !in || !out || p->failed)
+		return -1;
+	if (a != b && (a > b ? a - b : b - a) < p->bytes)
+		return -1;
+	if (vkResetCommandBuffer(p->command, 0) != VK_SUCCESS ||
+	    vkResetFences(p->device, 1, &p->fence) != VK_SUCCESS ||
+	    vkBeginCommandBuffer(p->command, &bi) != VK_SUCCESS)
+		goto fail;
+	memcpy(p->mapped, in, (size_t)p->bytes);
+	copy.size = p->bytes;
+	vkCmdCopyBuffer(p->command, p->staging, p->buffer, 1, &copy);
+	barrier(p, p->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+	launch.commandBuffer = &p->command;
+	launch.buffer = &p->buffer;
+	if (VkFFTAppend(&p->app, -1, &launch) != VKFFT_SUCCESS)
+		goto fail;
+	barrier(p, p->buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	vkCmdCopyBuffer(p->command, p->buffer, p->staging, 1, &copy);
+	barrier(p, p->staging, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+	if (vkEndCommandBuffer(p->command) != VK_SUCCESS)
+		goto fail;
+	si.pCommandBuffers = &p->command;
+	if (vkQueueSubmit(p->queue, 1, &si, p->fence) != VK_SUCCESS)
+		goto fail;
+	p->pending = 1;
+	if (complete_submission(p) < 0)
+		goto fail;
+	memcpy(out, p->mapped, (size_t)p->bytes);
+	return 0;
+fail:
+	p->failed = 1;
+	return -1;
+}
+
+float *fft_get_window(struct fft_plan *p)
+{
+	return p ? p->window : NULL;
 }
 
 const char *fft_backend_name(void)
 {
-	return g_gpu_name[0] ? g_gpu_name : "Vulkan";
+	return "Vulkan (VkFFT)"; /* Immutable: multiple live plans never race here. */
 }
-
-#else
-#include "fft_backend.h"
-/* stub: VkFFT not available */
-struct fft_plan *fft_plan_create(int nfft) { (void)nfft; return NULL; }
-void fft_plan_destroy(struct fft_plan *plan) { (void)plan; }
-void fft_execute(struct fft_plan *plan, const float *in, float *out)
-{ (void)plan; (void)in; (void)out; }
-float *fft_get_window(struct fft_plan *plan) { (void)plan; return NULL; }
-const char *fft_backend_name(void) { return "Vulkan (stub - not compiled)"; }
-#endif

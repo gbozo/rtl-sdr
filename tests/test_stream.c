@@ -37,8 +37,8 @@ static void test_fft_alias(void)
 	memcpy(saved, input, sizeof(input));
 	memcpy(inplace, input, sizeof(input));
 	dft(input, power, 16);
-	fft_execute(plan, input, output);
-	fft_execute(plan, inplace, inplace);
+	CHECK(fft_execute(plan, input, output) == 0);
+	CHECK(fft_execute(plan, inplace, inplace) == 0);
 	CHECK(memcmp(input, saved, sizeof(input)) == 0);
 	CHECK(memcmp(inplace, output, sizeof(output)) == 0);
 	for (int i = 0; i < 16; i++)
@@ -46,12 +46,12 @@ static void test_fft_alias(void)
 	fft_plan_destroy(plan);
 }
 
-static void fft_init(struct rtlsdr_server *srv, int step)
+static void fft_init_sized(struct rtlsdr_server *srv, int bins, int step, int accum)
 {
 	memset(srv, 0, sizeof(*srv));
-	srv->fft_bins = 16;
+	srv->fft_bins = bins;
 	srv->fft_step = step;
-	srv->fft_accum = 3;
+	srv->fft_accum = accum;
 	srv->fft_plan = fft_plan_create(srv->fft_bins);
 	CHECK(srv->fft_plan);
 	srv->fft_window = fft_get_window(srv->fft_plan);
@@ -81,8 +81,8 @@ static void test_fft_stream(int step)
 	const size_t chunks[] = {2, 8, 30, 6, 100, 4, 18};
 	size_t pos = 0, chunk_idx = 0;
 	double average[16] = {0};
-	fft_init(&a, step);
-	fft_init(&b, step);
+	fft_init_sized(&a, 16, step, 3);
+	fft_init_sized(&b, 16, step, 3);
 	CHECK(input);
 	for (size_t j = 0; j < bytes; j++)
 		input[j] = (uint8_t)(j * 29 + j / 13);
@@ -138,6 +138,40 @@ static void test_fft_stream(int step)
 	fft_destroy(&a);
 	fft_destroy(&b);
 	free(input);
+}
+
+static void test_production_fft(void)
+{
+	struct rtlsdr_server a, b;
+	const int bins = 1024, step = 4096, accum = 4;
+	size_t bytes = (size_t)step * accum * 2;
+	uint8_t *input = malloc(bytes);
+	double average[1024] = {0}, power[1024];
+	float windowed[2048];
+	CHECK(input);
+	fft_init_sized(&a, bins, step, accum);
+	fft_init_sized(&b, bins, step, accum);
+	for (size_t j = 0; j < bytes; j++) input[j] = (uint8_t)(j*29 + j/13);
+	CHECK(rtlsdr_server_process_fft(&a, input, bytes) == 0);
+	for (size_t pos = 0; pos < bytes;) {
+		size_t count = 2*((pos*7+31)%997 + 1);
+		if (count > bytes-pos) count = bytes-pos;
+		CHECK(rtlsdr_server_process_fft(&b, input+pos, count) == 0);
+		pos += count;
+	}
+	CHECK(a.fft_seq == 1 && b.fft_seq == 1 && a.fft_ready && b.fft_ready);
+	CHECK(a.fft_nsamples == 0 && a.fft_accum_count == 0);
+	CHECK(memcmp(a.fft_power, b.fft_power, sizeof(a.fft_power[0])*bins) == 0);
+	for (int hop = 0; hop < accum; hop++) {
+		for (int j = 0; j < bins; j++) {
+			windowed[2*j] = (input[2*(hop*step+j)]-127.5f)*a.fft_window[j];
+			windowed[2*j+1] = (input[2*(hop*step+j)+1]-127.5f)*a.fft_window[j];
+		}
+		dft(windowed, power, bins);
+		for (int j = 0; j < bins; j++) average[j] += power[j]/accum;
+	}
+	for (int j = 0; j < bins; j++) near(a.fft_power[j], average[j]);
+	fft_destroy(&a); fft_destroy(&b); free(input);
 }
 
 struct reader {
@@ -246,6 +280,7 @@ int main(void)
 	test_fft_alias();
 	test_fft_stream(16);
 	test_fft_stream(23);
+	test_production_fft();
 	test_socket();
 	test_send_deadline();
 	return 0;

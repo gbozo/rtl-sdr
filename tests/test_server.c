@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 static int fail_fft_input, fail_thread_create, input_allocations;
+static int fail_fft_execute;
 static struct rtlsdr_server *allocating_server;
 static int allocation_fds[4];
 
@@ -36,6 +37,11 @@ static int fault_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 	return pthread_create(thread, attr, start, arg);
 }
 
+static int fault_fft_execute(struct fft_plan *plan, const float *in, float *out)
+{
+	return fail_fft_execute ? -1 : fft_execute(plan, in, out);
+}
+
 /* An aliased white-box copy permits portable fault injection without adding
  * production hooks or replacing the normally linked server used below. */
 void fault_server_request_stop(struct rtlsdr_server *srv);
@@ -50,7 +56,9 @@ void fault_server_shutdown(struct rtlsdr_server *srv);
 #define rtlsdr_stream_sendv fault_stream_sendv
 #define malloc fault_malloc
 #define pthread_create fault_pthread_create
+#define fft_execute fault_fft_execute
 #include "../src/rtl_stream_server.c"
+#undef fft_execute
 #undef pthread_create
 #undef malloc
 #undef rtlsdr_stream_sendv
@@ -484,6 +492,33 @@ static void test_fft_start_failures(void)
 	rtlsdr_ring_destroy(ring);
 }
 
+static void test_fft_execution_failure(void)
+{
+	struct rtlsdr_server srv;
+	struct rtlsdr_ring *ring = rtlsdr_ring_create(8, 32768);
+	uint8_t input[8192];
+	float accumulated[FFT_DEFAULT_BINS];
+	CHECK(ring);
+	memset(input, 140, sizeof(input));
+	CHECK(fault_server_init(&srv, 0, unused_port(), ring, 100000000, 48000) == 0);
+	for (int i = 0; i < 3; i++)
+		CHECK(fault_server_process_fft(&srv, input, sizeof(input)) == 0);
+	CHECK(srv.fft_accum_count == 3 && srv.fft_seq == 0 && !srv.fft_ready);
+	memcpy(accumulated, srv.fft_acc, sizeof(accumulated));
+	CHECK(rtlsdr_ring_cursor_now(ring, &srv.fft_cursor) == 0);
+	CHECK(fault_server_publish(&srv, input, sizeof(input)) == 0);
+	fail_fft_execute = 1;
+	/* Run the real worker loop synchronously: failure must stop the session. */
+	fft_compute_thread(&srv);
+	CHECK(atomic_load(&srv.stopping));
+	CHECK(srv.fft_accum_count == 3 && srv.fft_seq == 0 && !srv.fft_ready);
+	CHECK(memcmp(accumulated, srv.fft_acc, sizeof(accumulated)) == 0);
+	for (int i = 0; i < FFT_DEFAULT_BINS; i++) CHECK(srv.fft_power[i] == 0);
+	fail_fft_execute = 0;
+	fault_server_shutdown(&srv);
+	rtlsdr_ring_destroy(ring);
+}
+
 static void test_client_saturation(void)
 {
 	struct rtlsdr_server srv;
@@ -513,6 +548,7 @@ static void test_client_saturation(void)
 
 int main(void)
 {
+	test_fft_execution_failure();
 	test_publish();
 	test_iq_and_reuse();
 	test_retune();

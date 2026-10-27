@@ -1,9 +1,10 @@
 # rtl_stream alpha: implementation and validation
 
-This documents the implemented CPU path, not a performance claim. Sustainable
+This documents the implemented CPU and optional Vulkan paths, not a performance claim. Sustainable
 capture throughput, client capacity and hardware loss rates are unmeasured.
 The server is experimental, unauthenticated, and intended for trusted networks.
-Linux and macOS CPU builds are tested in CI; Windows and VkFFT are not validated.
+Linux and macOS CPU builds are tested in CI. Vulkan has local Apple M4/MoltenVK
+synthetic correctness coverage described below, not GPU CI or Windows validation.
 
 ## Data flow and ownership
 
@@ -69,7 +70,61 @@ sent as data. A gap clears the hop, accumulator and published snapshot, advances
 the FFT generation, and disconnects older subscribers. Fresh subscriptions wait
 for a new completed average. CPU is the default backend. `ENABLE_VKFFT=ON`
 selects VkFFT/Vulkan at compile time, with no runtime fallback if GPU setup fails.
-GPU build/runtime behavior is outside the current CPU test coverage.
+
+Both backends accept power-of-two sizes 2..16384 and compute a forward complex
+FP32 FFT with negative exponent, no normalization and no bin shift. Windowing
+is external. `fft_execute` returns 0 or -1; input/output arrays must be identical
+or disjoint (partial overlap is rejected). Failure leaves caller output unchanged.
+A failed GPU execution poisons its plan. The server stops on failure before
+adding that window to the power accumulator or publishing a spectrum.
+
+### Optional Vulkan build and lifecycle
+
+```sh
+cmake -S . -B build-vkfft -DBUILD_TESTING=ON -DENABLE_VKFFT=ON \
+  -DTEST_VKFFT=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$VULKAN_SDK"
+cmake --build build-vkfft --parallel 4
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 \
+  ctest --test-dir build-vkfft --output-on-failure --timeout 60 -V
+```
+
+GPU builds require CMake >=3.18, Vulkan headers/loader and a compute-capable
+driver, a glslang CONFIG package (including its SPIRV-Tools dependencies), and
+a C++17-capable toolchain/runtime. The wrapper remains C11; CMake uses the C++
+linker only for GPU targets. VkFFT v1.3.4 is fetched at immutable commit
+`066a17c17068c0f11c9298d848c2976c71fad1c1`, without configuring upstream's benchmark
+project. CPU-only configuration neither fetches VkFFT nor requires Vulkan/glslang.
+CPU production with `BUILD_TESTING=OFF` remains C-only.
+
+`TEST_VKFFT=ON` explicitly adds GPU tests; missing dependencies or GPU setup fail,
+not skip. Standalone `cmake -S tests -B build-tests-gpu -DTEST_VKFFT=ON
+-DCMAKE_PREFIX_PATH="$VULKAN_SDK"` uses the same setup without requiring libusb.
+For an existing pinned checkout, CMake's `FETCHCONTENT_SOURCE_DIR_VKFFT` can
+avoid another fetch. Ordinary CPU CI does not enable these GPU tests.
+
+The backend selects the first compatible compute device, supports Vulkan
+portability enumeration/subset (MoltenVK), and requests no surface extensions.
+Each plan owns its instance/device, buffers, persistent coherent staging map,
+command buffer and fence. One checked submission records upload, FFT, download
+with transfer/compute/host barriers, followed by fence completion before CPU
+readback. Coherency removes flush/invalidate requirements, not synchronization.
+Device storage uses the logical byte size and actual Vulkan memory requirements;
+VkFFT owns any additional scratch. Calls on one plan must be serialized by its
+owner; distinct plans may coexist. Compiler initialization is once per process,
+plan compilation is serialized, and a per-thread C locale avoids global locale
+mutation. glslang is deliberately not finalized by plan destruction, so destroying
+one plan cannot invalidate another plan or another compiler user.
+
+**Shutdown is not bounded against a hung GPU driver.** Wrapper submissions wait
+indefinitely; a wait error poisons the plan and drains the device (or observes
+device loss) before resource release. Timeout does not imply cancellation.
+Separately, pinned VkFFT's internal LUT initialization helpers still use a
+100-second wait and may release pending resources on upstream failure paths.
+The wrapper cannot repair cleanup already performed inside `initializeVkFFT`;
+this remains a dependency safety limitation, not hardened or bounded shutdown.
+Precomputed LUT twiddles are explicitly selected: automatic device sin/cos on
+the tested M4 exceeded the fixed component tolerance at N=16384. No upstream
+patches or runtime CPU fallback are used.
 
 ## RTLSTREAM/2 wire format
 
@@ -98,11 +153,13 @@ see `stream_client/README.md` for commands. No compatibility negotiation exists.
 
 ## Tests and CI
 
-Root and standalone `tests/` CMake builds register eight native tests:
+Root and standalone `tests/` CMake builds retain the eight native tests:
 `test_dsp`, `test_dsp_spectral`, `test_stream`, `test_ring`, `test_server`,
-`test_proto`, `test_client_c`, and `test_client_cpp`. The spectral white-box test
-includes the DSP implementation and must not link another copy. C++11 is enabled
-only when building tests (`BUILD_TESTING` defaults to OFF in the root build).
+`test_proto`, `test_client_c`, and `test_client_cpp`, plus `test_fft_backend`.
+The spectral white-box test
+includes the DSP implementation and must not link another copy. C++ is enabled
+only for tests (C++11 clients) or the GPU compiler dependency (C++17-capable
+toolchain); `BUILD_TESTING` defaults to OFF.
 Each native test has a 60-second timeout; a hang fails.
 Go race tests/vet and Node tests run separately, as shown in the root README.
 
@@ -116,4 +173,33 @@ The release-only workflow runs native, Go and Node tests before installation,
 tarball packaging and upload; Docker publication depends on those jobs. PR
 workflows have read-only repository permission and no publishing credentials.
 Tests exercise software with synthetic signals and loopback peers, not dongle
-capture, RF calibration, sustained real-time performance or the GPU backend.
+capture, RF calibration or sustained real-time performance.
+
+Local Vulkan validation used Apple M4, MoltenVK 1.4.1, Vulkan SDK 1.4.341.1,
+glslang 16.2.0, CMake 4.3.2 and Apple Clang 21.0.0. All 13 root native tests
+passed with Khronos validation and synchronization validation enabled, with no
+validation errors or warnings. CPU standalone ASan/UBSan and TSan each passed
+all nine tests. This is one driver/toolchain combination, not portability or
+throughput certification.
+
+GPU tests compare both real and imaginary components against a test-only CPU
+reference (plus a double-precision DFT for small sizes): zero, impulse, complex
+DC, positive/negative tones and seeded random input at 2, 16, 1024 and 16384.
+The fixed unit-input tolerance is `2e-5*sqrt(N) + 3e-5*abs(reference)` per component;
+small DFT checks use `2e-5 + 2e-5*abs(reference)`. Maximum observed GPU/CPU component
+error was 0.0009765625; tolerances were not relaxed after testing. Tests cover
+in-place/disjoint buffers, preserved input, invalid sizes/overlap, repeat use,
+multiple live plans, destruction order and concurrent creation. Stream tests
+also check Blackman-Harris 1024-bin/4096-hop/four-window power averages against
+a DFT and verify fragmentation equivalence.
+
+White-box seams inject wrapper buffer creation/allocation/bind/map and
+command reset/begin/end/submit/wait errors, including a synthetic timeout while
+real GPU work must be drained. They assert unchanged output, poisoned plans and
+no pending-resource release. A server worker fault test rejects the fourth window
+without changing the prior three-window accumulator or publishing an average,
+and verifies session stop. These are not a complete Vulkan mock: actual device
+loss, hung drivers, all instance/device/fence/pool failures and upstream internal
+allocation/LUT failures remain untested. GPU driver and prebuilt glslang binaries
+are not covered by the CPU sanitizer runs. GPU CTests fail on validation-error
+or synchronization-hazard output as well as nonzero exit and 60-second timeout.

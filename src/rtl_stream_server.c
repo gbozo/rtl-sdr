@@ -364,7 +364,8 @@ int rtlsdr_server_process_fft(struct rtlsdr_server *srv,
 				srv->fft_in[i * 2] *= srv->fft_window[i];
 				srv->fft_in[i * 2 + 1] *= srv->fft_window[i];
 			}
-			fft_execute(srv->fft_plan, srv->fft_in, srv->fft_in);
+			if (fft_execute(srv->fft_plan, srv->fft_in, srv->fft_in) < 0)
+				return -1; /* Worker stops before accumulation or publication. */
 			for (i = 0; i < srv->fft_bins; i++)
 				srv->fft_acc[i] += srv->fft_in[i * 2] * srv->fft_in[i * 2] +
 					srv->fft_in[i * 2 + 1] * srv->fft_in[i * 2 + 1];

@@ -41,6 +41,7 @@ CMakeCache.txt
 */CMakeFiles
 CMakeFiles
 *.cmake
+!/cmake/Modules/RTLStreamVkFFT.cmake
 
 build/
 build-novkfft/

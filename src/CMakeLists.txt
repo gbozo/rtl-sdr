@@ -107,90 +107,15 @@ set(RTL_STREAM_SOURCES
 
 if(ENABLE_VKFFT)
     list(APPEND RTL_STREAM_SOURCES fft/fft_vkfft.c)
-
-    include(FetchContent)
-    FetchContent_Declare(
-        VkFFT
-        GIT_REPOSITORY https://github.com/DTolm/VkFFT.git
-        GIT_TAG v1.3.4
-    )
-    FetchContent_GetProperties(VkFFT)
-    if(NOT vkfft_POPULATED)
-        FetchContent_Populate(VkFFT)
-    endif()
-
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(VULKAN vulkan IMPORTED_TARGET)
-    endif()
-    if(VULKAN_FOUND)
-        set(VULKAN_TARGET PkgConfig::VULKAN)
-    else()
-        find_library(VULKAN_LIB vulkan)
-        find_path(VULKAN_INCLUDE vulkan/vulkan.h)
-        if(VULKAN_LIB AND VULKAN_INCLUDE)
-            add_library(Vulkan_rtl UNKNOWN IMPORTED)
-            set_target_properties(Vulkan_rtl PROPERTIES
-                IMPORTED_LOCATION "${VULKAN_LIB}"
-                INTERFACE_INCLUDE_DIRECTORIES "${VULKAN_INCLUDE}"
-            )
-            set(VULKAN_TARGET Vulkan_rtl)
-        endif()
-    endif()
-
-    if(NOT VULKAN_TARGET)
-        message(FATAL_ERROR "Vulkan library not found. Install libvulkan-dev or disable ENABLE_VKFFT")
-    endif()
-
-    add_executable(rtl_stream ${RTL_STREAM_SOURCES})
-    target_link_libraries(rtl_stream rtlsdr_static
-        ${LIBUSB_LIBRARIES}
-        ${CMAKE_THREAD_LIBS_INIT}
-        ${VULKAN_TARGET}
-    )
-    target_include_directories(rtl_stream PRIVATE
-        /usr/include/glslang/Include
-    )
-    target_include_directories(rtl_stream SYSTEM PRIVATE
-        ${vkfft_SOURCE_DIR}
-        ${vkfft_SOURCE_DIR}/vkFFT
-    )
-    target_compile_definitions(rtl_stream PRIVATE HAVE_VKFFT VKFFT_BACKEND=0)
-
-    find_library(GLSLANG_LIB glslang)
-    find_library(GLSLANG_OSDEP OSDependent)
-    find_library(GLSLANG_MI MachineIndependent)
-    find_library(GLSLANG_OGLC OGLCompiler)
-    find_library(GLSLANG_GENCODE GenericCodeGen)
-    find_library(GLSLANG_HLSL HLSL)
-    find_library(GLSLANG_SPIRV SPIRV)
-    find_library(GLSLANG_RLIMITS glslang-default-resource-limits)
-    find_library(SPIRV_TOOLS SPIRV-Tools)
-    find_library(SPIRV_TOOLS_OPT SPIRV-Tools-opt)
-    find_library(SPIRV_TOOLS_LINK SPIRV-Tools-link)
-    target_link_libraries(rtl_stream
-        "-Wl,--start-group"
-        ${GLSLANG_GENCODE}
-        ${GLSLANG_OSDEP}
-        ${GLSLANG_OGLC}
-        ${GLSLANG_MI}
-        ${GLSLANG_LIB}
-        ${SPIRV_TOOLS}
-        ${SPIRV_TOOLS_LINK}
-        ${SPIRV_TOOLS_OPT}
-        ${GLSLANG_SPIRV}
-        ${GLSLANG_HLSL}
-        ${GLSLANG_RLIMITS}
-        "-Wl,--end-group"
-        stdc++
-    )
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules/RTLStreamVkFFT.cmake)
 else()
     list(APPEND RTL_STREAM_SOURCES fft/fft_cpu.c)
-    add_executable(rtl_stream ${RTL_STREAM_SOURCES})
-    target_link_libraries(rtl_stream rtlsdr_static
-        ${LIBUSB_LIBRARIES}
-        ${CMAKE_THREAD_LIBS_INIT}
-    )
+endif()
+add_executable(rtl_stream ${RTL_STREAM_SOURCES})
+target_link_libraries(rtl_stream rtlsdr_static ${LIBUSB_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+if(ENABLE_VKFFT)
+    target_link_libraries(rtl_stream rtl_stream_vkfft)
+    set_target_properties(rtl_stream PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 set_target_properties(rtl_stream PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES)

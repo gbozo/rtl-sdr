@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
 #include "fft_backend.h"
 
@@ -109,9 +110,13 @@ void fft_plan_destroy(struct fft_plan *plan)
 	free(plan);
 }
 
-void fft_execute(struct fft_plan *plan, const float *in, float *out)
+int fft_execute(struct fft_plan *plan, const float *in, float *out)
 {
 	int i, j, k, step, half;
+	uintptr_t a = (uintptr_t)in, b = (uintptr_t)out;
+	if (!plan || !in || !out || (a != b &&
+	    (a > b ? a - b : b - a) < (size_t)plan->nfft * 2 * sizeof(float)))
+		return -1;
 	int n = plan->nfft;
 	int log2n = plan->log2n;
 	float *tw_r = plan->twiddle_r;
@@ -139,6 +144,7 @@ void fft_execute(struct fft_plan *plan, const float *in, float *out)
 			}
 		}
 	}
+	return 0;
 }
 
 float *fft_get_window(struct fft_plan *plan)
