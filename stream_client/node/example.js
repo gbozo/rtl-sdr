@@ -1,4 +1,4 @@
-const { RtlsdrStreamClient, MODE_IQ } = require('./client');
+const { RtlsdrStreamClient, MODE_IQ, EVT_STREAM_END } = require('./client');
 
 if (process.argv.length < 5) {
   console.error(`Usage: node ${process.argv[1]} <host> <port> <freq_hz>`);
@@ -7,7 +7,7 @@ if (process.argv.length < 5) {
 
 const host = process.argv[2];
 const port = parseInt(process.argv[3]);
-const freq = parseInt(process.argv[4]);
+const freq = BigInt(process.argv[4]);
 
 async function main() {
   const client = new RtlsdrStreamClient();
@@ -16,15 +16,18 @@ async function main() {
     await client.connect(host, port);
     console.log(`Connected to rtl_stream at ${host}:${port}, freq=${freq} Hz`);
 
-    await client.request(freq, 2400000, 200000, MODE_IQ);
+    await client.request(freq, 240000, 192000, MODE_IQ);
     console.log('Receiving I/Q frames (Ctrl+C to stop)...');
 
-    let frameCount = 0;
-
     while (true) {
-      const { hdr, samples } = await client.readIQ(2048);
+      const { hdr, samples, event } = await client.readIQ();
+      if (event) {
+        if (event.type === EVT_STREAM_END) break;
+        console.log(`Frequency changed to ${event.freq} Hz`);
+        continue;
+      }
+      if (samples.length === 0) continue;
       console.log(`I/Q frame: freq=${hdr.freq} rate=${hdr.rate} seq=${hdr.seq} sample[0]=(${samples[0]},${samples[1]})`);
-      frameCount++;
     }
   } catch (err) {
     if (err.code !== 'ECONNRESET' && !err.message.includes('write after end')) {

@@ -11,28 +11,55 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++
 
     env:
       CC: ${{ matrix.compiler }}
+      CXX: ${{ matrix.cxx }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libusb-1.0-0-dev cmake build-essential
+        run: sudo apt-get update -qq && sudo apt-get install -y libusb-1.0-0-dev cmake build-essential clang
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Configure with CMake
-        run: cmake .
+        run: cmake -S . -B build -DBUILD_TESTING=ON -DENABLE_VKFFT=OFF
 
       - name: Build
-        run: make -j$(nproc)
+        run: cmake --build build --parallel 4
+
+      - name: Native tests before packaging
+        run: ctest --test-dir build --output-on-failure --timeout 60
+
+      - name: Go race tests and vet
+        working-directory: stream_client/go
+        run: |
+          go test -race -timeout 60s ./...
+          go vet ./...
+
+      - name: Node tests
+        run: node stream_client/node/client.test.js
 
       - name: Install
-        run: sudo make install
+        run: sudo cmake --install build
 
       - name: Verify library
         run: ls -la /usr/local/lib/librtlsdr* /usr/local/bin/rtl_*

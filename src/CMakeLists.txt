@@ -193,6 +193,8 @@ else()
     )
 endif()
 
+set_target_properties(rtl_stream PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES)
+
 set(INSTALL_TARGETS rtlsdr rtlsdr_static rtl_sdr rtl_tcp rtl_test rtl_fm rtl_eeprom rtl_adsb rtl_power rtl_biast rtl_list rtl_stream)
 
 target_link_libraries(rtl_sdr rtlsdr convenience_static
@@ -231,7 +233,6 @@ target_link_libraries(rtl_list rtlsdr convenience_static
     ${LIBUSB_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
-# Optional VkFFT backend - enable with find_package(VkFFT) and add fft/fft_vkfft.c to sources
 if(UNIX)
 target_link_libraries(rtl_fm m)
 target_link_libraries(rtl_adsb m)

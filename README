@@ -20,19 +20,73 @@ the following changes on top of upstream:
     warning fixes, and a fix for application hang on USB transfer errors.
 
   CI / Release automation
-    GitHub Actions workflow builds the project with both gcc and clang
-    on every release. Compiled artifacts (shared/static libraries, headers,
-    executables) are packaged as tarballs and attached to each GitHub
-    release.
+    Pushes and pull requests build/test the CPU backend with Linux GCC,
+    Linux Clang and macOS Clang, including native, Go and Node clients.
+    Separate Linux ASan/UBSan and TSan jobs check native tests. Release
+    builds run tests before packaging libraries, headers and executables.
 
   Docker images
     Multi-stage Alpine-based Docker images are built and published to
     ghcr.io on each release. The images contain the rtl-sdr runtime
     libraries and all command-line utilities (rtl_sdr, rtl_tcp, rtl_test,
-    rtl_fm, rtl_eeprom, rtl_adsb, rtl_power, rtl_biast).
+    rtl_fm, rtl_eeprom, rtl_adsb, rtl_power, rtl_biast, rtl_list, rtl_stream).
 
     Usage:
       docker run --rm ghcr.io/gbozo/rtl-sdr:<tag> rtl_test -h
+
+rtl_stream (alpha)
+==================
+
+One dongle supplies multiple independently channelized TCP clients and an
+optional wideband FFT stream. This is experimental software: throughput,
+maximum sustainable client count and real-hardware loss rates have NOT
+been measured. Do not infer real-time guarantees from unit-test results.
+
+  rtl_list -j -p
+  rtl_stream -f 100.5M -s 2.4M -p 1234 -P 1235 -i 0
+
+The ring uses mutex-protected copies into private reader buffers, not
+borrowed pointers or a lock-free scheme. I/Q gaps disconnect the affected
+reader. FFT gaps reset accumulation and disconnect old subscribers.
+Retuning terminates the capture session; reconnect only after restarting
+the server with the new capture configuration.
+
+Requested output rates must divide the actual capture rate exactly, with
+an integer ratio from 1 through 4096. Filtered bandwidth is at most 80% of
+the output rate; zero selects floor(4*rate/5). The only unfiltered exception
+is equal capture/output rates, full bandwidth and zero frequency offset.
+Even this raw mode retains the nominal 10 Hz capture-center DC notch,
+which precedes frequency mixing. The requested passband must fit inside
+the capture, and filter plans exceeding the implementation budget fail.
+
+RTLSTREAM/2 is intentionally incompatible with version 1. All headers and
+payloads are big-endian; use rebuilt version-2 clients. Tracked legacy
+Linux Go executables under stream_client/go are still version 1: rebuild
+from source rather than running those binaries. See stream_client/README.md
+for client usage and docs/rtl_stream.md for architecture and wire details.
+
+The CPU FFT is the default build. ENABLE_VKFFT=ON selects the experimental
+VkFFT/Vulkan backend at compile time; it is NOT a runtime CPU fallback.
+Only CPU builds are covered by the test matrix. Listeners have no TLS or
+authentication and bind all interfaces; restrict access with a firewall.
+
+Build and test (Linux/macOS, libusb-1.0, pthreads, C11 and C++11 compilers):
+
+  cmake -S . -B build -DBUILD_TESTING=ON -DENABLE_VKFFT=OFF
+  cmake --build build --parallel 4
+  ctest --test-dir build --output-on-failure --timeout 60
+  (cd stream_client/go && go test -race -timeout 60s ./... && go vet ./...)
+  node stream_client/node/client.test.js
+
+Native tests need no dongle and can also be built without libusb:
+
+  cmake -S tests -B build-tests -DCMAKE_BUILD_TYPE=Release
+  cmake --build build-tests --parallel 4
+  ctest --test-dir build-tests --output-on-failure --timeout 60
+
+BUILD_TESTING defaults to OFF for a production-only C build without the C++
+client-test compiler requirement. Go and Node tests run separately from
+CTest. CI uses Go 1.26 and Node 22. See docs/rtl_stream.md for limitations.
 
 For more information on the upstream rtl-sdr project see:
   http://sdr.osmocom.org/trac/wiki/rtl-sdr

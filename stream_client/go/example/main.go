@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -27,7 +28,7 @@ func main() {
 	}
 	defer client.Close()
 
-	err = client.Request(freq, 2400000, 200000, rtlstream.ModeIQ)
+	err = client.Request(freq, 240000, 192000, rtlstream.ModeIQ)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to send request: %v\n", err)
 		os.Exit(1)
@@ -39,7 +40,7 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	samples := make([]int16, 4096)
+	samples := make([]int16, rtlstream.MaxIQComponents)
 
 	for {
 		select {
@@ -48,9 +49,24 @@ func main() {
 			return
 		default:
 			hdr, n, err := client.ReadIQ(samples)
+			var event *rtlstream.Event
+			if errors.As(err, &event) {
+				if event.Type == rtlstream.StreamEnd {
+					return
+				}
+				fmt.Printf("Frequency changed to %d Hz\n", event.Freq)
+				continue
+			}
+			if errors.Is(err, rtlstream.ErrCapacity) {
+				fmt.Fprintf(os.Stderr, "Frame drained: need %d components\n", hdr.NSamples)
+				continue
+			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
 				return
+			}
+			if n == 0 {
+				continue
 			}
 			fmt.Printf("I/Q frame: freq=%d rate=%d seq=%d nsamples=%d sample[0]=(%d,%d)\n",
 				hdr.Freq, hdr.Rate, hdr.Seq, n, samples[0], samples[1])

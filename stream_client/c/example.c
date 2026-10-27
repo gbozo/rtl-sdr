@@ -16,7 +16,7 @@ int main(int argc, char **argv)
 {
 	rtlsdr_stream_ctx *ctx;
 	struct rtlsdr_stream_iq_hdr hdr;
-	int16_t samples[4096];
+	int16_t samples[RTLSTREAM_MAX_IQ_COMPONENTS];
 
 	if (argc < 4) {
 		fprintf(stderr, "Usage: %s <host> <port> <freq_hz>\n", argv[0]);
@@ -33,7 +33,7 @@ int main(int argc, char **argv)
 
 	uint64_t freq = (uint64_t)atoll(argv[3]);
 
-	if (rtlsdr_stream_request(ctx, freq, 2400000ULL, 200000ULL, 0) < 0) {
+	if (rtlsdr_stream_request(ctx, freq, 240000ULL, 192000ULL, RTLSTREAM_MODE_IQ) < 0) {
 		fprintf(stderr, "Failed to send request\n");
 		rtlsdr_stream_close(ctx);
 		return 1;
@@ -44,8 +44,22 @@ int main(int argc, char **argv)
 	printf("Receiving I/Q frames (Ctrl+C to stop)...\n");
 
 	while (running) {
-		if (rtlsdr_stream_read_iq(ctx, &hdr, samples, 2048) < 0)
+		int result = rtlsdr_stream_read_iq(ctx, &hdr, samples, RTLSTREAM_MAX_IQ_COMPONENTS);
+		if (result == RTLSTREAM_READ_EVENT) {
+			const struct rtlsdr_stream_event *event = rtlsdr_stream_last_event(ctx);
+			if (event->type == RTLSTREAM_EVT_STREAM_END)
+				break;
+			printf("Frequency changed to %llu Hz\n", (unsigned long long)event->freq);
+			continue;
+		}
+		if (result == RTLSTREAM_ERROR_CAPACITY) {
+			fprintf(stderr, "Frame drained: need %u components\n", hdr.nsamples);
+			continue;
+		}
+		if (result < 0)
 			break;
+		if (hdr.nsamples == 0)
+			continue;
 		printf("I/Q frame: freq=%lu rate=%lu seq=%lu "
 		       "sample[0]=(%d,%d)\n",
 		       (unsigned long)hdr.freq,

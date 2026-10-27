@@ -55,7 +55,7 @@ if(CMAKE_COMPILER_IS_GNUCC AND NOT WIN32)
     ADD_DEFINITIONS(-Wno-unused-parameter)
     ADD_DEFINITIONS(-Wno-unused)
     ADD_DEFINITIONS(-Wsign-compare)
-    ADD_DEFINITIONS(-Wdeclaration-after-statement)
+    add_compile_options("$<$<COMPILE_LANGUAGE:C>:-Wdeclaration-after-statement>")
     #http://gcc.gnu.org/wiki/Visibility
     add_definitions(-fvisibility=hidden)
 elseif(MSVC14 OR MSVC14)
@@ -149,6 +149,11 @@ install(FILES
 # Add subdirectories
 ########################################################################
 add_subdirectory(src)
+option(BUILD_TESTING "Build hardware-free rtl_stream and client tests" OFF)
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
 
 ########################################################################
 # Create Pkg Config File

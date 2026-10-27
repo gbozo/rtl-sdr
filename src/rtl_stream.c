@@ -17,7 +17,10 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <pthread.h>
-#include <sys/time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <poll.h>
 
 #include "rtl-sdr.h"
 #include "rtl_ring.h"
@@ -27,69 +30,53 @@
 #define RING_SLOT_COUNT  512
 #define RING_SLOT_SIZE   (256 * 1024)
 
-volatile int do_exit = 0;
+static volatile sig_atomic_t do_exit;
+static volatile sig_atomic_t signal_write_fd = -1;
+static atomic_int capture_done;
+static atomic_int server_done;
+static int capture_result;
+static int server_result;
 static rtlsdr_dev_t *g_dev = NULL;
-struct rtlsdr_server g_server;
+static struct rtlsdr_server g_server;
+
+static void wake_main(void)
+{
+	uint8_t byte = 1;
+	int saved = errno;
+	if (signal_write_fd >= 0)
+		(void)write(signal_write_fd, &byte, 1);
+	errno = saved;
+}
 
 static void sighandler(int signum)
 {
 	(void)signum;
 	do_exit = 1;
-	if (g_dev)
-		rtlsdr_cancel_async(g_dev);
+	wake_main();
 }
 
 static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
 	struct rtlsdr_server *srv = (struct rtlsdr_server *)ctx;
-	void *dest;
-
-	if (do_exit || len == 0)
-		return;
-
-	dest = rtlsdr_ring_write_ptr(srv->ring);
-	if (!dest)
-		return;
-
-	memcpy(dest, buf, len <= RING_SLOT_SIZE ? len : RING_SLOT_SIZE);
-	rtlsdr_ring_publish(srv->ring, len);
-
-	pthread_mutex_lock(&srv->data_mutex);
-	pthread_cond_broadcast(&srv->data_cond);
-	pthread_mutex_unlock(&srv->data_mutex);
+	if (!atomic_load(&srv->stopping))
+		rtlsdr_server_publish(srv, buf, len);
 }
 
 static void *async_reader_thread(void *arg)
 {
 	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)arg;
-	rtlsdr_read_async(dev, rtlsdr_callback, &g_server, 0, 32);
+	capture_result = rtlsdr_read_async(dev, rtlsdr_callback, &g_server, 0, RING_SLOT_SIZE);
+	atomic_store(&capture_done, 1);
+	wake_main();
 	return NULL;
 }
 
-static void *freq_monitor(void *arg)
+static void *server_thread(void *arg)
 {
 	(void)arg;
-	while (!do_exit) {
-		sleep(1);
-		if (g_dev) {
-			uint32_t current = rtlsdr_get_center_freq(g_dev);
-			if (current != 0 &&
-			    current != (uint32_t)g_server.capture_freq) {
-				fprintf(stderr, "rtl_stream: freq changed "
-					"from %u to %u\n",
-					(uint32_t)g_server.capture_freq,
-					current);
-				g_server.freq_changed = 1;
-				g_server.new_freq = current;
-				g_server.capture_freq = current;
-				g_server.freq_changed = 0;
-				pthread_mutex_lock(&g_server.data_mutex);
-				pthread_cond_broadcast(&g_server.data_cond);
-				pthread_mutex_unlock(&g_server.data_mutex);
-				break;
-			}
-		}
-	}
+	server_result = rtlsdr_server_run(&g_server);
+	atomic_store(&server_done, 1);
+	wake_main();
 	return NULL;
 }
 
@@ -97,16 +84,18 @@ static double parse_freq(const char *arg)
 {
 	char *end;
 	double val = strtod(arg, &end);
-
+	if (end == arg)
+		return NAN;
 	if (*end) {
 		switch (*end) {
 		case 'k': case 'K': val *= 1e3;  break;
 		case 'm': case 'M': val *= 1e6;  break;
 		case 'g': case 'G': val *= 1e9;  break;
-		default: break;
+		default: return NAN;
 		}
+		end++;
 	}
-	return val;
+	return *end ? NAN : val;
 }
 
 static void usage(void)
@@ -135,7 +124,12 @@ int main(int argc, char **argv)
 	int list_only = 0;
 	int opt;
 	pthread_t async_thread;
-	pthread_t monitor_thread;
+	pthread_t listener_thread;
+	int signal_pipe[2] = {-1, -1};
+	int initialized = 0, capture_started = 0, server_started = 0;
+	int result = 1, retuned = 0;
+	uint32_t actual_rate, actual_freq;
+	struct sigaction action;
 	struct rtlsdr_ring *ring = NULL;
 
 	static struct option long_options[] = {
@@ -203,24 +197,26 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	if (freq == 0)
+	if (!isfinite(freq) || freq <= 0 || freq > UINT32_MAX ||
+	    !isfinite(sample_rate) || sample_rate <= 0 || sample_rate > UINT32_MAX ||
+	    iq_port < 1 || iq_port > 65535 || fft_port < 0 || fft_port > 65535 || dev_index < 0)
 		usage();
 
-	signal(SIGINT,  sighandler);
-	signal(SIGTERM, sighandler);
-	signal(SIGPIPE, SIG_IGN);
+	if (pipe(signal_pipe) < 0 ||
+	    fcntl(signal_pipe[0], F_SETFL, O_NONBLOCK) < 0 ||
+	    fcntl(signal_pipe[1], F_SETFL, O_NONBLOCK) < 0)
+		goto cleanup;
+	signal_write_fd = signal_pipe[1];
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = sighandler;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGINT, &action, NULL) < 0 || sigaction(SIGTERM, &action, NULL) < 0)
+		goto cleanup;
 
 	ring = rtlsdr_ring_create(RING_SLOT_COUNT, RING_SLOT_SIZE);
 	if (!ring) {
 		fprintf(stderr, "Failed to create ring buffer\n");
-		return 1;
-	}
-
-	if (rtlsdr_server_init(&g_server, iq_port, fft_port, ring,
-			       (uint64_t)freq, (uint64_t)sample_rate) < 0) {
-		fprintf(stderr, "Failed to initialize server\n");
-		rtlsdr_ring_destroy(ring);
-		return 1;
+		goto cleanup;
 	}
 
 	if (rtlsdr_open(&g_dev, (uint32_t)dev_index) < 0) {
@@ -228,29 +224,86 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	rtlsdr_set_tuner_gain_mode(g_dev, 1);
-	rtlsdr_set_center_freq(g_dev, (uint32_t)freq);
-	rtlsdr_set_sample_rate(g_dev, (uint32_t)sample_rate);
-	rtlsdr_reset_buffer(g_dev);
+	if (rtlsdr_set_tuner_gain_mode(g_dev, 1) < 0 ||
+	    rtlsdr_set_center_freq(g_dev, (uint32_t)freq) < 0 ||
+	    rtlsdr_set_sample_rate(g_dev, (uint32_t)sample_rate) < 0 ||
+	    rtlsdr_reset_buffer(g_dev) < 0) {
+		fprintf(stderr, "Failed to configure device\n");
+		goto cleanup;
+	}
+	actual_rate = rtlsdr_get_sample_rate(g_dev);
+	actual_freq = rtlsdr_get_center_freq(g_dev);
+	if (!actual_rate || !actual_freq) {
+		fprintf(stderr, "Failed to read device configuration\n");
+		goto cleanup;
+	}
+	if (rtlsdr_server_init(&g_server, iq_port, fft_port, ring, actual_freq, actual_rate) < 0) {
+		fprintf(stderr, "Failed to initialize server\n");
+		goto cleanup;
+	}
+	initialized = 1;
 
 	fprintf(stderr, "rtl_stream: freq=%.0f rate=%.0f iq_port=%d fft_port=%d dev=%d\n",
-		freq, sample_rate, iq_port, fft_port, dev_index);
+		(double)actual_freq, (double)actual_rate, iq_port, fft_port, dev_index);
 	fprintf(stderr, "rtl_stream: FFT backend: %s\n", fft_backend_name());
 
-	pthread_create(&async_thread, NULL, async_reader_thread, g_dev);
-	pthread_create(&monitor_thread, NULL, freq_monitor, NULL);
-
-	rtlsdr_server_run(&g_server);
-
-	rtlsdr_cancel_async(g_dev);
-	pthread_join(async_thread, NULL);
-	pthread_join(monitor_thread, NULL);
-
-	rtlsdr_close(g_dev);
-	g_dev = NULL;
+	atomic_init(&capture_done, 0);
+	atomic_init(&server_done, 0);
+	if (do_exit || pthread_create(&listener_thread, NULL, server_thread, NULL))
+		goto cleanup;
+	server_started = 1;
+	if (pthread_create(&async_thread, NULL, async_reader_thread, g_dev))
+		goto cleanup;
+	capture_started = 1;
+	result = 0;
+	while (!do_exit && !atomic_load(&capture_done) && !atomic_load(&server_done)) {
+		struct pollfd pfd = {signal_pipe[0], POLLIN, 0};
+		int n = poll(&pfd, 1, 1000);
+		if (n < 0 && errno != EINTR) {
+			result = 1;
+			break;
+		}
+		if (n > 0) {
+			uint8_t buf[64];
+			while (read(signal_pipe[0], buf, sizeof(buf)) > 0) {}
+		}
+		if (!retuned && !do_exit) {
+			uint32_t current = rtlsdr_get_center_freq(g_dev);
+			if (current && current != actual_freq) {
+				fprintf(stderr, "rtl_stream: frequency changed; session terminated\n");
+				rtlsdr_server_notify_frequency_change(&g_server, current);
+				retuned = 1;
+			}
+		}
+	}
 
 cleanup:
-	rtlsdr_server_shutdown(&g_server);
+	if (initialized)
+		rtlsdr_server_request_stop(&g_server);
+	if (capture_started) {
+		/* Retry cancellation if shutdown raced entry into read_async(). */
+		while (!atomic_load(&capture_done)) {
+			rtlsdr_cancel_async(g_dev);
+			poll(NULL, 0, 20);
+		}
+		pthread_join(async_thread, NULL);
+		if (capture_result < 0)
+			result = 1;
+	}
+	if (server_started) {
+		pthread_join(listener_thread, NULL);
+		if (server_result < 0)
+			result = 1;
+	}
+	if (initialized)
+		rtlsdr_server_shutdown(&g_server);
+	if (g_dev)
+		rtlsdr_close(g_dev);
 	rtlsdr_ring_destroy(ring);
-	return 0;
+	signal_write_fd = -1;
+	if (signal_pipe[0] >= 0)
+		close(signal_pipe[0]);
+	if (signal_pipe[1] >= 0)
+		close(signal_pipe[1]);
+	return result;
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -35,14 +36,14 @@ func main() {
 		}
 		defer c.Close()
 
-		err = c.Request(100600000, 2400000, 200000, rtlstream.ModeIQ)
+		err = c.Request(100600000, 240000, 192000, rtlstream.ModeIQ)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "IQ request: %v\n", err)
 			return
 		}
 		fmt.Println("=== IQ client connected ===")
 
-		samples := make([]int16, 4096)
+		samples := make([]int16, rtlstream.MaxIQComponents)
 		var maxRMS float64
 
 		for i := 0; ; i++ {
@@ -53,9 +54,20 @@ func main() {
 			}
 
 			hdr, n, err := c.ReadIQ(samples)
+			var event *rtlstream.Event
+			if errors.As(err, &event) {
+				if event.Type == rtlstream.StreamEnd {
+					return
+				}
+				fmt.Printf("IQ frequency change: %d Hz\n", event.Freq)
+				continue
+			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "IQ read: %v\n", err)
 				return
+			}
+			if n == 0 {
+				continue
 			}
 
 			var meanI, meanQ, meanP float64
@@ -74,7 +86,7 @@ func main() {
 				maxRMS = rms
 			}
 			if i < 5 || i%50 == 49 {
-			fmt.Printf("IQ #%d: freq=%d rate=%d seq=%d DC=(%.0f,%.0f) RMS=%.0f maxRMS=%.0f\n",
+				fmt.Printf("IQ #%d: freq=%d rate=%d seq=%d DC=(%.0f,%.0f) RMS=%.0f maxRMS=%.0f\n",
 					i, hdr.Freq, hdr.Rate, hdr.Seq,
 					meanI, meanQ, rms, maxRMS)
 			}
@@ -91,7 +103,7 @@ func main() {
 			}
 			defer c.Close()
 
-			err = c.Request(100600000, 2400000, 200000, rtlstream.ModeFFT)
+			err = c.Request(0, 0, 0, rtlstream.ModeFFT)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "FFT request: %v\n", err)
 				return
@@ -107,6 +119,14 @@ func main() {
 				}
 
 				hdr, power, err := c.ReadFFT(power)
+				var event *rtlstream.Event
+				if errors.As(err, &event) {
+					if event.Type == rtlstream.StreamEnd {
+						return
+					}
+					fmt.Printf("FFT frequency change: %d Hz\n", event.Freq)
+					continue
+				}
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "FFT read: %v\n", err)
 					return
@@ -128,7 +148,11 @@ func main() {
 				}
 				avg := s / float64(hdr.Bins)
 				sort.Float64s(p)
-				t5 := p[len(p)-5:]
+				start := len(p) - 5
+				if start < 0 {
+					start = 0
+				}
+				t5 := p[start:]
 				if i < 3 || i%25 == 24 {
 					fmt.Printf("FFT #%d: max=%.0f avg=%.0f top5=%v\n",
 						i, mx, avg, t5)

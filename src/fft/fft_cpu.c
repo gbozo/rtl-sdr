@@ -117,7 +117,8 @@ void fft_execute(struct fft_plan *plan, const float *in, float *out)
 	float *tw_r = plan->twiddle_r;
 	float *tw_i = plan->twiddle_i;
 
-	memcpy(out, in, n * 2 * sizeof(float));
+	if (in != out)
+		memcpy(out, in, n * 2 * sizeof(float));
 	bit_reverse(out, n);
 
 	for (step = 1, k = 0; k < log2n; k++, step <<= 1) {

@@ -25,7 +25,7 @@ int main(int argc, char **argv)
 		client.connect(argv[1], std::atoi(argv[2]));
 
 		uint64_t freq = std::atoll(argv[3]);
-		client.request(freq, 2400000ULL, 200000ULL,
+		client.request(freq, 240000ULL, 192000ULL,
 		               rtlsdr::RTLSTREAM_MODE_IQ);
 
 		std::cout << "Connected to rtl_stream at " << argv[1]
@@ -36,13 +36,21 @@ int main(int argc, char **argv)
 		std::vector<int16_t> samples(4096);
 
 		while (running) {
-			auto hdr = client.readIQ(samples);
-			std::cout << "I/Q frame: freq=" << hdr.freq
-			          << " rate=" << hdr.rate
-			          << " seq=" << hdr.seq
-			          << " sample[0]=("
-			          << samples[0] << ","
-			          << samples[1] << ")\n";
+			try {
+				auto hdr = client.readIQ(samples);
+				if (samples.empty())
+					continue;
+				std::cout << "I/Q frame: freq=" << hdr.freq
+				          << " rate=" << hdr.rate
+				          << " seq=" << hdr.seq
+				          << " sample[0]=("
+				          << samples[0] << ","
+				          << samples[1] << ")\n";
+			} catch (const rtlsdr::StreamEvent &event) {
+				if (event.type == rtlsdr::EventType::StreamEnd)
+					break;
+				std::cout << "Frequency changed to " << event.freq << " Hz\n";
+			}
 		}
 	} catch (const std::exception &e) {
 		std::cerr << "Error: " << e.what() << "\n";

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -9,12 +10,12 @@ import (
 )
 
 const (
-	host     = "127.0.0.1"
-	iqPort   = 1234
-	fftPort  = 1235
-	freq     = 100600000
-	rate     = 2400000
-	bw       = 200000
+	host    = "127.0.0.1"
+	iqPort  = 1234
+	fftPort = 1235
+	freq    = 100600000
+	rate    = 240000
+	bw      = 192000
 )
 
 func main() {
@@ -55,22 +56,35 @@ func doIQ() error {
 	}
 	fmt.Printf("IQ: connected, tuned to %.1f MHz\n", float64(freq)/1e6)
 
-	samples := make([]int16, 4096)
+	samples := make([]int16, rtlstream.MaxIQComponents)
 
 	for i := 0; i < 5; i++ {
 		hdr, n, err := c.ReadIQ(samples)
+		var event *rtlstream.Event
+		if errors.As(err, &event) {
+			if event.Type == rtlstream.StreamEnd {
+				return nil
+			}
+			fmt.Printf("IQ frequency change: %d Hz\n", event.Freq)
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("IQ read: %w", err)
+		}
+		if n == 0 {
+			fmt.Printf("IQ frame %d: freq=%.1f MHz seq=%d empty\n",
+				i, float64(hdr.Freq)/1e6, hdr.Seq)
+			continue
 		}
 		mean := 0.0
 		for _, s := range samples[:n] {
 			if s < 0 {
-				mean += float64(-s)
+				mean -= float64(s)
 			} else {
 				mean += float64(s)
 			}
 		}
-		mean /= 100
+		mean /= float64(n)
 		fmt.Printf("IQ frame %d: freq=%.1f MHz seq=%d mean_mag=%.1f\n",
 			i, float64(hdr.Freq)/1e6, hdr.Seq, mean)
 	}
@@ -98,6 +112,14 @@ func doFFT() error {
 
 	for i := 0; i < 10; i++ {
 		hdr, power, err := c.ReadFFT(power)
+		var event *rtlstream.Event
+		if errors.As(err, &event) {
+			if event.Type == rtlstream.StreamEnd {
+				return nil
+			}
+			fmt.Printf("FFT frequency change: %d Hz\n", event.Freq)
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("FFT read: %w", err)
 		}
@@ -114,7 +136,11 @@ func doFFT() error {
 		}
 
 		binWidth := float64(hdr.Rate) / float64(hdr.Bins)
-		peakFreq := float64(hdr.Freq) - float64(hdr.Rate)/2 + float64(peakIdx)*binWidth
+		signedBin := peakIdx
+		if peakIdx >= int(hdr.Bins)/2 {
+			signedBin -= int(hdr.Bins)
+		}
+		peakFreq := float64(hdr.Freq) + float64(signedBin)*binWidth
 		peak = float64(peakVal)
 		lastPeakFreq = peakFreq
 

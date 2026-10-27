@@ -1,0 +1,99 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU / ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake libusb-1.0-0-dev build-essential clang
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install libusb pkg-config
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Configure CPU build
+        run: cmake -S . -B build -DBUILD_TESTING=ON -DENABLE_VKFFT=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Native tests
+        run: ctest --test-dir build --output-on-failure --timeout 60
+      - name: Go race tests and vet
+        working-directory: stream_client/go
+        run: |
+          go test -race -timeout 60s ./...
+          go vet ./...
+      - name: Node tests
+        run: node stream_client/node/client.test.js
+
+  sanitizers:
+    name: Linux / ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan-UBSan
+            flags: -fsanitize=address,undefined -fno-omit-frame-pointer
+          - name: TSan
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+    env:
+      CC: clang-14
+      CXX: clang++-14
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake libusb-1.0-0-dev clang-14 libclang-rt-14-dev
+      - name: Configure TSan-compatible address layout
+        if: matrix.name == 'TSan'
+        run: |
+          # LLVM 14 TSan reserves a fixed shadow range; newer runner kernels
+          # can otherwise fail before main with an unexpected memory mapping.
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure instrumented CPU build
+        run: >-
+          cmake -S . -B build -DBUILD_TESTING=ON -DENABLE_VKFFT=OFF
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+          -DCMAKE_SHARED_LINKER_FLAGS="${{ matrix.flags }}"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Native tests (sanitizer/runtime failures are failures)
+        run: ctest --test-dir build --output-on-failure --timeout 60
